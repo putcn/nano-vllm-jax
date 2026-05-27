@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies (CPU JAX for CI)
+        run: |
+          pip install jax flax chex transformers safetensors numpy
+          pip install pytest pytest-xdist ruff
+          pip install -e .
+
+      - name: Lint
+        run: ruff check nanovllm_jax/ tests/
+
+      - name: Run unit tests
+        run: pytest tests/unit/ -v
