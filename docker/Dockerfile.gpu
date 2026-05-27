@@ -1,0 +1,68 @@
+# =============================================================================
+# nano-vllm-jax — GPU Development Image
+# Base: NVIDIA CUDA 12.4 + cuDNN 9 + Ubuntu 22.04
+# JAX: jax[cuda12] (XLA GPU backend)
+# Usage: see README.md
+# =============================================================================
+FROM nvidia/cuda:12.4.1-cudnn9-devel-ubuntu22.04
+
+# Prevent interactive prompts during apt
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# XLA / JAX GPU flags
+ENV XLA_PYTHON_CLIENT_PREALLOCATE=false
+ENV XLA_PYTHON_CLIENT_MEM_FRACTION=0.85
+ENV JAX_PLATFORMS=cuda
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-dev \
+    python3.11-venv \
+    python3-pip \
+    git \
+    curl \
+    wget \
+    vim \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Make python3.11 the default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
+
+# Upgrade pip
+RUN pip install --upgrade pip setuptools wheel
+
+# Install JAX with CUDA 12 support first (separate step for better caching)
+RUN pip install --upgrade \
+    "jax[cuda12]>=0.4.25" \
+    "jaxlib>=0.4.25"
+
+# Install remaining Python dependencies
+RUN pip install --upgrade \
+    "flax>=0.9.0" \
+    "optax>=0.2.0" \
+    "transformers>=4.40.0" \
+    "safetensors>=0.4.0" \
+    "chex>=0.1.86" \
+    "numpy>=1.26" \
+    "torch>=2.3" \
+    "pytest>=8.0" \
+    "pytest-xdist" \
+    "ruff>=0.4" \
+    "ipython" \
+    "ipykernel"
+
+# Set working directory
+WORKDIR /workspace
+
+# Copy project and install in editable mode
+COPY . .
+RUN pip install -e ".[dev]"
+
+# Default command: run unit tests
+CMD ["pytest", "tests/unit/", "-v"]

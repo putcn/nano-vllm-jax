@@ -1,0 +1,52 @@
+# =============================================================================
+# nano-vllm-jax — CPU Development Image
+# Base: Python 3.11 slim (no CUDA)
+# JAX: CPU-only build
+# Usage: see README.md
+# =============================================================================
+FROM python:3.11-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV JAX_PLATFORMS=cpu
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    vim \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip
+RUN pip install --upgrade pip setuptools wheel
+
+# Install CPU-only JAX
+RUN pip install --upgrade \
+    "jax>=0.4.25" \
+    "jaxlib>=0.4.25"
+
+# Install remaining Python dependencies
+# torch CPU-only (only needed for numerical reference tests)
+RUN pip install --upgrade \
+    "flax>=0.9.0" \
+    "optax>=0.2.0" \
+    "transformers>=4.40.0" \
+    "safetensors>=0.4.0" \
+    "chex>=0.1.86" \
+    "numpy>=1.26" \
+    "torch>=2.3" --extra-index-url https://download.pytorch.org/whl/cpu \
+    "pytest>=8.0" \
+    "pytest-xdist" \
+    "ruff>=0.4" \
+    "ipython"
+
+# Set working directory
+WORKDIR /workspace
+
+# Copy project and install in editable mode
+COPY . .
+RUN pip install -e ".[dev]"
+
+# Default command: run unit tests
+CMD ["pytest", "tests/unit/", "-v"]

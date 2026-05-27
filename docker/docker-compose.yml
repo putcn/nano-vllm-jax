@@ -1,0 +1,55 @@
+# docker-compose for nano-vllm-jax dev environments
+# Usage: see README.md
+
+services:
+
+  # -----------------------------------------------------------------------
+  # GPU development container
+  # Requires: nvidia-container-toolkit on host
+  # -----------------------------------------------------------------------
+  dev-gpu:
+    build:
+      context: ..        # repo root (so COPY . . gets the full project)
+      dockerfile: docker/Dockerfile.gpu
+    image: nano-vllm-jax:gpu
+    container_name: nano-vllm-jax-gpu
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - XLA_PYTHON_CLIENT_PREALLOCATE=false
+      - XLA_PYTHON_CLIENT_MEM_FRACTION=0.85
+      - HF_HOME=/workspace/.cache/huggingface
+    volumes:
+      # Mount repo root for live code editing (editable install)
+      - ..:/workspace
+      # Persist HuggingFace model cache across container restarts
+      - hf_cache:/workspace/.cache/huggingface
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    command: bash
+
+  # -----------------------------------------------------------------------
+  # CPU development container (no GPU required, fast CI-style)
+  # -----------------------------------------------------------------------
+  dev-cpu:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cpu
+    image: nano-vllm-jax:cpu
+    container_name: nano-vllm-jax-cpu
+    environment:
+      - JAX_PLATFORMS=cpu
+      - HF_HOME=/workspace/.cache/huggingface
+    volumes:
+      - ..:/workspace
+      - hf_cache:/workspace/.cache/huggingface
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    command: bash
+
+volumes:
+  hf_cache:
+    driver: local
