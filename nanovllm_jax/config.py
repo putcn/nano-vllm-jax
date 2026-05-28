@@ -32,6 +32,7 @@ class EngineConfig:
     dtype: str = "bfloat16"
     max_model_len: int = 4096
     enforce_eager: bool = False
+    eos_token_id: int = 2          # default Llama EOS; 0 = disabled
 
     # ---- Cache / scheduling fields ----
     block_size: int = 16

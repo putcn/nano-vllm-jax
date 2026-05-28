@@ -24,14 +24,9 @@ class Sequence:
     seq_id: int
     prompt_token_ids: list[int]
     sampling_params: SamplingParams
-    # Paged KV cache: list of block indices allocated to this sequence
     block_table: list[int] = field(default_factory=list)
     output_token_ids: list[int] = field(default_factory=list)
     status: SequenceStatus = SequenceStatus.WAITING
-
-    # ----------------------------------------------------------------
-    # Properties
-    # ----------------------------------------------------------------
 
     @property
     def prompt_len(self) -> int:
@@ -57,26 +52,29 @@ class Sequence:
     def is_finished(self) -> bool:
         return self.status == SequenceStatus.FINISHED
 
-    # ----------------------------------------------------------------
-    # Mutations
-    # ----------------------------------------------------------------
-
     def append_token(self, token_id: int) -> None:
         self.output_token_ids.append(token_id)
 
-    def check_stop(self) -> None:
-        """Mark finished if EOS or max_tokens reached."""
+    def check_stop(self, eos_token_id: int = 0) -> None:
+        """Mark finished if max_tokens reached, EOS emitted, or stop_token_id hit.
+
+        Args:
+            eos_token_id: Engine-level EOS token (0 = disabled).
+        """
         sp = self.sampling_params
         if self.output_len >= sp.max_tokens:
             self.status = SequenceStatus.FINISHED
             return
-        if sp.stop_token_ids and self.last_token_id in sp.stop_token_ids:
+        last = self.last_token_id
+        if eos_token_id and last == eos_token_id and not sp.ignore_eos:
+            self.status = SequenceStatus.FINISHED
+            return
+        if sp.stop_token_ids and last in sp.stop_token_ids:
             self.status = SequenceStatus.FINISHED
 
 
 @dataclass
 class SequenceGroup:
-    """Groups sequences that share the same prompt (beam search / parallel sampling)."""
     group_id: int
     sequences: list[Sequence] = field(default_factory=list)
 
