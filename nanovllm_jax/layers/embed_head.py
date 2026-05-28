@@ -9,24 +9,6 @@ import jax.numpy as jnp
 from flax import nnx
 
 
-def _param_array(param) -> jax.Array:
-    """Extract the raw jax.Array from an nnx.Param regardless of Flax version.
-
-    nnx.Param.__getitem__(Ellipsis) changed behaviour across Flax versions:
-    - Old Flax: returns the underlying array directly.
-    - New Flax: returns a wrapped Variable object, not a bare array.
-    Using .raw_value (new) / .value (deprecated) / direct cast avoids this.
-    """
-    if hasattr(param, 'raw_value'):
-        return jnp.asarray(param.raw_value)
-    if hasattr(param, 'get_value'):
-        return jnp.asarray(param.get_value())
-    if hasattr(param, 'value'):
-        return jnp.asarray(param.value)
-    # Already a plain array
-    return jnp.asarray(param)
-
-
 class VocabParallelEmbedding(nnx.Module):
     def __init__(
         self,
@@ -44,12 +26,29 @@ class VocabParallelEmbedding(nnx.Module):
         self.vocab_start_idx = self.num_embeddings_per_partition * tp_rank
         self.vocab_end_idx = self.vocab_start_idx + self.num_embeddings_per_partition
         self.weight = nnx.Param(jnp.zeros((self.num_embeddings_per_partition, embedding_dim)))
+        # _weight_cache bypasses nnx.Param getter instability; always a plain jax.Array
+        object.__setattr__(self, '_weight_cache', None)
 
     def load_weight(self, weight: jax.Array) -> None:
-        self.weight = nnx.Param(jnp.array(weight[self.vocab_start_idx:self.vocab_end_idx, :]))
+        arr = jnp.array(weight[self.vocab_start_idx:self.vocab_end_idx, :])
+        self.weight = nnx.Param(arr)
+        object.__setattr__(self, '_weight_cache', arr)
+
+    def _get_weight(self) -> jax.Array:
+        """Return the weight as a plain jax.Array, always."""
+        cached = object.__getattribute__(self, '_weight_cache')
+        if cached is not None:
+            return cached
+        # Fallback for freshly-constructed (not yet loaded) modules
+        w = self.weight
+        if hasattr(w, 'get_raw_value'):
+            return jnp.asarray(w.get_raw_value())
+        if hasattr(w, 'value'):
+            return jnp.asarray(w.value)
+        return jnp.asarray(w)
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        w = _param_array(self.weight)
+        w = self._get_weight()
         if self.tp_size == 1:
             return w[x]
         mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
@@ -73,6 +72,7 @@ class ParallelLMHead(nnx.Module):
         self.num_embeddings_per_partition = num_embeddings // tp_size
         self.weight = nnx.Param(jnp.zeros((self.num_embeddings_per_partition, embedding_dim)))
         self._tied_embed: nnx.data = nnx.data(None)
+        object.__setattr__(self, '_weight_cache', None)
 
     def tie_weights(self, embed: VocabParallelEmbedding) -> None:
         assert embed.num_embeddings == self.num_embeddings
@@ -82,18 +82,34 @@ class ParallelLMHead(nnx.Module):
     def load_weight(self, weight: jax.Array) -> None:
         start = self.tp_rank * self.num_embeddings_per_partition
         end = start + self.num_embeddings_per_partition
-        self.weight = nnx.Param(jnp.array(weight[start:end, :]))
+        arr = jnp.array(weight[start:end, :])
+        self.weight = nnx.Param(arr)
+        object.__setattr__(self, '_weight_cache', arr)
+
+    def _get_weight(self) -> jax.Array:
+        """Return the effective weight as a plain jax.Array, always stable."""
+        # Check for tied embedding first
+        tied = self._tied_embed
+        if hasattr(tied, 'value'):
+            tied = tied.value
+        if tied is not None:
+            return tied._get_weight()
+        # Use local cache
+        cached = object.__getattribute__(self, '_weight_cache')
+        if cached is not None:
+            return cached
+        # Fallback
+        w = self.weight
+        if hasattr(w, 'get_raw_value'):
+            return jnp.asarray(w.get_raw_value())
+        if hasattr(w, 'value'):
+            return jnp.asarray(w.value)
+        return jnp.asarray(w)
 
     @property
     def effective_weight(self) -> jax.Array:
         """Return the weight matrix as a plain jax.Array."""
-        tied = self._tied_embed
-        # unwrap nnx.data wrapper if present
-        if hasattr(tied, 'value'):
-            tied = tied.value
-        if tied is not None:
-            return _param_array(tied.weight)
-        return _param_array(self.weight)
+        return self._get_weight()
 
     def __call__(
         self,
@@ -102,4 +118,4 @@ class ParallelLMHead(nnx.Module):
     ) -> jax.Array:
         if last_indices is not None:
             x = x[last_indices]
-        return x @ self.effective_weight.T
+        return x @ self._get_weight().T
