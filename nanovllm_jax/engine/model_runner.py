@@ -248,6 +248,9 @@ class ModelRunner:
         self._ensure_model()
         if isinstance(self._model, _StubModel):
             return {seq.seq_id: self._model.eos_token_id for seq in seqs}
-        _, ids, pos, bi, bo, seq_lens, _ = self._build_decode_inputs(seqs)
-        logits = self._model(ids, pos, self._kv_cache, bi, bo, seq_lens, is_prefill=False)
+        _, ids, pos, bi, bo, seq_lens, block_table = self._build_decode_inputs(seqs)
+        logits = self._model(
+            ids, pos, self._kv_cache, bi, bo, seq_lens,
+            is_prefill=False, block_table=block_table,
+        )
         return {seq.seq_id: int(jnp.argmax(logits[i])) for i, seq in enumerate(seqs)}
