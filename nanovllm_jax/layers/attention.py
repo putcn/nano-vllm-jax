@@ -1,6 +1,6 @@
 """Paged KV Cache and Attention (JAX port of nanovllm/layers/attention.py).
 
-Status: ✅ Done (Phase 3)
+Status: ✅ Fixed (nnx.jit persistence, shape contracts)
 
 Design notes vs PyTorch original:
 - PagedKVCache uses jax.lax.dynamic_update_slice / dynamic_slice instead of
@@ -9,6 +9,17 @@ Design notes vs PyTorch original:
   _decode (single-step KV lookup) based on is_prefill flag.
 - No flash-attention yet — plain scaled dot-product in float32.
   Flash attention (via jax.nn.dot_product_attention) is Phase 6.
+
+KV Cache mutability and nnx.jit
+--------------------------------
+PagedKVCache.write() assigns a new nnx.Variable to self.cache. Under plain
+jax.jit this Python-level mutation is NOT visible outside the JIT boundary,
+so decode steps would always see an all-zero cache.
+
+The fix is to call forward functions with nnx.jit (done in model_runner.py).
+nx.jit extracts nnx.Variable state, threads it through XLA as mutable
+arrays, and writes updates back to the Python objects after every call.
+PagedKVCache.write() itself does not need to change.
 
 Shape contract
 --------------
@@ -36,6 +47,12 @@ class PagedKVCache(nnx.Module):
 
     Layout: cache[layer, 2, num_blocks, block_size, num_kv_heads, head_dim]
       - dim 1: 0 = keys, 1 = values
+
+    Mutability note
+    ---------------
+    write() assigns self.cache = nnx.Variable(new_cache). This is a Python-
+    level object mutation. It is only propagated correctly when the containing
+    forward function is compiled with nnx.jit (not jax.jit). See model_runner.py.
     """
 
     def __init__(
@@ -67,8 +84,13 @@ class PagedKVCache(nnx.Module):
         keys: jax.Array,            # (num_real_tokens, num_kv_heads, head_dim)
         values: jax.Array,          # (num_real_tokens, num_kv_heads, head_dim)
     ) -> None:
-        """Write *real* tokens into the cache.  Padding tokens must NOT be included."""
-        cache = self.cache.get_value()
+        """Write *real* tokens into the cache.  Padding tokens must NOT be included.
+
+        This method mutates self.cache (an nnx.Variable). The mutation is
+        propagated back to the outer Python scope only when called inside
+        an nnx.jit-compiled function (not jax.jit).
+        """
+        cache = self.cache.value
         num_real = keys.shape[0]
 
         def body(i, c):
@@ -88,7 +110,7 @@ class PagedKVCache(nnx.Module):
         seq_lens: jax.Array,      # (num_real_seqs,) int32
     ) -> tuple[jax.Array, jax.Array]:
         """Read cached KV for *real* sequences only."""
-        cache = self.cache.get_value()
+        cache = self.cache.value
         k_cache = cache[layer_idx, 0]
         v_cache = cache[layer_idx, 1]
 
