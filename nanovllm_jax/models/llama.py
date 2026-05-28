@@ -1,16 +1,6 @@
 """Llama model (JAX port of nanovllm/models/llama.py).
 
 Status: ✅ Done (Phase 4)
-
-Components built bottom-up:
-  LlamaMLP          — SwiGLU feed-forward
-  LlamaAttention    — QKV proj + RoPE + Attention + output proj
-  LlamaDecoderLayer — RMSNorm + Attention + MLP with residual
-  LlamaModel        — embedding + N decoder layers + final norm
-  LlamaForCausalLM  — LlamaModel + LM head (weight-tied)
-
-Weight loading follows the original nanovllm weight_loader pattern:
-  each layer exposes load_weights(params: dict[str, jax.Array]).
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -39,19 +29,17 @@ from nanovllm_jax.layers.sampler import Sampler
 
 @dataclass
 class LlamaConfig:
-    """Subset of HuggingFace LlamaConfig fields used by this implementation."""
     hidden_size: int = 4096
     intermediate_size: int = 11008
     num_hidden_layers: int = 32
     num_attention_heads: int = 32
     num_key_value_heads: int = 32
-    head_dim: Optional[int] = None          # inferred if None
+    head_dim: Optional[int] = None
     max_position_embeddings: int = 4096
     rms_norm_eps: float = 1e-5
     vocab_size: int = 32000
     rope_theta: float = 10000.0
     tie_word_embeddings: bool = False
-    # TP (single-device default)
     tp_size: int = 1
     tp_rank: int = 0
 
@@ -65,12 +53,9 @@ class LlamaConfig:
 # ---------------------------------------------------------------------------
 
 class LlamaMLP(nnx.Module):
-    """SwiGLU MLP: down(silu(gate(x)) * up(x))."""
-
     def __init__(self, config: LlamaConfig) -> None:
         tp = config.tp_size
         tr = config.tp_rank
-        # gate and up are merged into one ColumnParallel for efficiency
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
             [config.intermediate_size, config.intermediate_size],
@@ -96,8 +81,6 @@ class LlamaMLP(nnx.Module):
 # ---------------------------------------------------------------------------
 
 class LlamaAttention(nnx.Module):
-    """Multi-head / GQA attention with RoPE."""
-
     def __init__(self, config: LlamaConfig, layer_idx: int) -> None:
         tp = config.tp_size
         tr = config.tp_rank
@@ -130,8 +113,8 @@ class LlamaAttention(nnx.Module):
 
     def __call__(
         self,
-        x: jax.Array,             # (T, hidden_size)
-        positions: jax.Array,     # (T,) int32
+        x: jax.Array,
+        positions: jax.Array,
         kv_cache: PagedKVCache,
         block_indices: jax.Array,
         block_offsets: jax.Array,
@@ -140,30 +123,20 @@ class LlamaAttention(nnx.Module):
         block_table: Optional[jax.Array] = None,
     ) -> jax.Array:
         T = x.shape[0]
-        qkv = self.qkv_proj(x)   # (T, (H + 2*Hkv) * head_dim)
-
-        # Split QKV
-        q_size = (self.num_heads // self.attn.num_heads * self.attn.num_heads) * self.head_dim
-        # Use the layer's local head counts (post-TP)
+        qkv = self.qkv_proj(x)
         local_q = self.attn.num_heads
         local_kv = self.attn.num_kv_heads
         hd = self.head_dim
         q = qkv[:, :local_q * hd].reshape(T, local_q, hd)
         k = qkv[:, local_q * hd: (local_q + local_kv) * hd].reshape(T, local_kv, hd)
         v = qkv[:, (local_q + local_kv) * hd:].reshape(T, local_kv, hd)
-
-        # Apply RoPE
         q, k = self.rope(q, k, positions)
-
-        # Attention
         out = self.attn(
             q, k, v, kv_cache,
             block_indices, block_offsets, seq_lens,
             is_prefill, block_table,
-        )  # (T, local_q, hd) or (num_seqs, local_q, hd)
-
-        # Merge heads and project
-        out = out.reshape(out.shape[0], -1)  # (T, local_q * hd)
+        )
+        out = out.reshape(out.shape[0], -1)
         return self.o_proj(out)
 
     def load_weights(self, params: dict) -> None:
@@ -178,8 +151,6 @@ class LlamaAttention(nnx.Module):
 # ---------------------------------------------------------------------------
 
 class LlamaDecoderLayer(nnx.Module):
-    """Single transformer block: norm → attn → residual → norm → mlp → residual."""
-
     def __init__(self, config: LlamaConfig, layer_idx: int) -> None:
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -197,14 +168,12 @@ class LlamaDecoderLayer(nnx.Module):
         is_prefill: bool,
         block_table: Optional[jax.Array] = None,
     ) -> jax.Array:
-        # Fused residual norm: returns (normed, residual)
         normed, residual = self.input_layernorm(x, residual=jnp.zeros_like(x))
         attn_out = self.self_attn(
             normed, positions, kv_cache,
             block_indices, block_offsets, seq_lens,
             is_prefill, block_table,
         )
-        # Second fused residual norm
         normed2, residual2 = self.post_attention_layernorm(attn_out, residual=residual)
         mlp_out = self.mlp(normed2)
         return mlp_out + residual2
@@ -231,24 +200,25 @@ class LlamaDecoderLayer(nnx.Module):
 # ---------------------------------------------------------------------------
 
 class LlamaModel(nnx.Module):
-    """Llama transformer: embedding + N decoder layers + final norm."""
-
     def __init__(self, config: LlamaConfig) -> None:
         self.config = config
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size,
             tp_size=config.tp_size, tp_rank=config.tp_rank,
         )
-        self.layers = [
+        # nnx.List lets Flax NNX traverse and track nested Module parameters.
+        # A plain Python list is treated as a static attribute and raises
+        # ValueError when it contains Module instances (data in static slot).
+        self.layers = nnx.List([
             LlamaDecoderLayer(config, i)
             for i in range(config.num_hidden_layers)
-        ]
+        ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def __call__(
         self,
-        input_ids: jax.Array,       # (T,) int32
-        positions: jax.Array,       # (T,) int32
+        input_ids: jax.Array,
+        positions: jax.Array,
         kv_cache: PagedKVCache,
         block_indices: jax.Array,
         block_offsets: jax.Array,
@@ -256,7 +226,7 @@ class LlamaModel(nnx.Module):
         is_prefill: bool,
         block_table: Optional[jax.Array] = None,
     ) -> jax.Array:
-        x = self.embed_tokens(input_ids)  # (T, hidden_size)
+        x = self.embed_tokens(input_ids)
         for layer in self.layers:
             x = layer(
                 x, positions, kv_cache,
@@ -278,8 +248,6 @@ class LlamaModel(nnx.Module):
 
 
 class LlamaForCausalLM(nnx.Module):
-    """Llama causal LM: model + LM head, optional weight tying."""
-
     def __init__(self, config: LlamaConfig) -> None:
         self.config = config
         self.model = LlamaModel(config)
@@ -308,8 +276,7 @@ class LlamaForCausalLM(nnx.Module):
             block_indices, block_offsets, seq_lens,
             is_prefill, block_table,
         )
-        logits = self.lm_head(hidden, last_indices=last_indices)
-        return logits
+        return self.lm_head(hidden, last_indices=last_indices)
 
     def sample(
         self,
@@ -323,14 +290,6 @@ class LlamaForCausalLM(nnx.Module):
                             top_k=top_k, top_p=top_p)
 
     def load_weights(self, params: dict) -> None:
-        """Load weights from a flat dict keyed by HuggingFace param names.
-
-        Expects keys like:
-          model.embed_tokens.weight
-          model.layers.0.self_attn.q_proj.weight
-          ...
-          lm_head.weight
-        """
         model_params = {
             k.removeprefix("model."): v
             for k, v in params.items() if k.startswith("model.")

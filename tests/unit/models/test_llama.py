@@ -1,7 +1,4 @@
-"""Unit tests for Llama model components (Phase 4).
-
-All tests use tiny configs (2 layers, small dims) to stay fast on CPU.
-"""
+"""Unit tests for Llama model components (Phase 4)."""
 import pytest
 import numpy as np
 import jax
@@ -22,10 +19,6 @@ from nanovllm_jax.layers.attention import PagedKVCache
 def rand(shape, seed=0):
     return np.random.default_rng(seed).standard_normal(shape).astype(np.float32)
 
-
-# ---------------------------------------------------------------------------
-# Tiny config used throughout
-# ---------------------------------------------------------------------------
 
 def tiny_config(**kwargs) -> LlamaConfig:
     defaults = dict(
@@ -55,12 +48,32 @@ def make_cache(config: LlamaConfig, num_blocks=16, block_size=8) -> PagedKVCache
     )
 
 
-def prefill_args(T: int, num_seqs: int = 1):
-    """Return (block_indices, block_offsets, seq_lens, is_prefill=True)."""
+def prefill_args(T: int):
     bi = jnp.arange(T, dtype=jnp.int32) // 8
     bo = jnp.arange(T, dtype=jnp.int32) % 8
-    sl = jnp.array([T] * num_seqs, dtype=jnp.int32)
+    sl = jnp.array([T], dtype=jnp.int32)
     return bi, bo, sl
+
+
+def load_random_weights(layer, cfg, seed=42):
+    """Load non-trivial random weights into a LlamaDecoderLayer."""
+    rng = np.random.default_rng(seed)
+    H = cfg.hidden_size
+    I = cfg.intermediate_size
+    Hq = cfg.num_attention_heads * cfg.head_dim
+    Hkv = cfg.num_key_value_heads * cfg.head_dim
+    params = {
+        "input_layernorm.weight":           rng.standard_normal(H).astype(np.float32) + 1.0,
+        "post_attention_layernorm.weight":  rng.standard_normal(H).astype(np.float32) + 1.0,
+        "self_attn.q_proj.weight":          rng.standard_normal((Hq, H)).astype(np.float32),
+        "self_attn.k_proj.weight":          rng.standard_normal((Hkv, H)).astype(np.float32),
+        "self_attn.v_proj.weight":          rng.standard_normal((Hkv, H)).astype(np.float32),
+        "self_attn.o_proj.weight":          rng.standard_normal((H, Hq)).astype(np.float32),
+        "mlp.gate_proj.weight":             rng.standard_normal((I, H)).astype(np.float32),
+        "mlp.up_proj.weight":               rng.standard_normal((I, H)).astype(np.float32),
+        "mlp.down_proj.weight":             rng.standard_normal((H, I)).astype(np.float32),
+    }
+    layer.load_weights(params)
 
 
 # ---------------------------------------------------------------------------
@@ -108,13 +121,11 @@ def test_attention_layer_decode_shape():
     cfg = tiny_config()
     attn = LlamaAttention(cfg, layer_idx=0)
     cache = make_cache(cfg)
-    # Prefill first
     T = 4
     x_p = jnp.array(rand((T, cfg.hidden_size)))
     pos_p = jnp.arange(T, dtype=jnp.int32)
     bi, bo, sl = prefill_args(T)
     attn(x_p, pos_p, cache, bi, bo, sl, is_prefill=True)
-    # Decode
     x_d = jnp.array(rand((1, cfg.hidden_size)))
     pos_d = jnp.array([T], dtype=jnp.int32)
     bi_d = jnp.array([0], dtype=jnp.int32)
@@ -142,16 +153,17 @@ def test_decoder_layer_shape():
 
 
 def test_decoder_layer_residual():
-    """Output must differ from input (residual doesn't collapse to zero)."""
+    """With non-trivial weights, output must differ from input."""
     cfg = tiny_config()
     layer = LlamaDecoderLayer(cfg, layer_idx=0)
+    load_random_weights(layer, cfg)
     cache = make_cache(cfg)
     T = 4
     x = jnp.array(rand((T, cfg.hidden_size)))
     pos = jnp.arange(T, dtype=jnp.int32)
     bi, bo, sl = prefill_args(T)
     out = layer(x, pos, cache, bi, bo, sl, is_prefill=True)
-    assert not jnp.allclose(out, x)
+    assert not jnp.allclose(out, x, atol=1e-3)
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +183,6 @@ def test_llama_model_shape():
 
 
 def test_llama_model_deterministic():
-    """Same inputs must produce same outputs."""
     cfg = tiny_config()
     model = LlamaModel(cfg)
     cache_a = make_cache(cfg)
