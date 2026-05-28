@@ -9,7 +9,7 @@ class ModelConfig:
     tokenizer: Optional[str] = None
     dtype: str = "bfloat16"
     max_model_len: int = 4096
-    enforce_eager: bool = False  # if True, skip jax.jit
+    enforce_eager: bool = False
 
     def __post_init__(self):
         if self.tokenizer is None:
@@ -19,35 +19,30 @@ class ModelConfig:
 @dataclass
 class CacheConfig:
     block_size: int = 16
-    num_gpu_blocks: int = 0  # 0 = auto-detect
+    num_gpu_blocks: int = 0
     max_num_seqs: int = 256
 
 
 @dataclass
 class EngineConfig:
-    """Flat engine config used by Scheduler, BlockManager, and ModelRunner.
-
-    Accepts either the flat keyword arguments used throughout the engine
-    (model, block_size, num_gpu_blocks, max_num_seqs, ...) **or** nested
-    model_config / cache_config objects for backwards compatibility.
-    """
-    # ---- Model fields (mirrors ModelConfig) ----
+    """Flat engine config used by Scheduler, BlockManager, and ModelRunner."""
+    # ---- Model fields ----
     model: str = ""
     tokenizer: Optional[str] = None
     dtype: str = "bfloat16"
     max_model_len: int = 4096
     enforce_eager: bool = False
 
-    # ---- Cache / scheduling fields (mirrors CacheConfig) ----
+    # ---- Cache / scheduling fields ----
     block_size: int = 16
     num_gpu_blocks: int = 0
     max_num_seqs: int = 256
+    max_num_batched_tokens: int = 2048
 
     def __post_init__(self):
         if self.tokenizer is None:
             self.tokenizer = self.model
 
-    # Convenience constructors
     @classmethod
     def from_configs(cls, model_config: ModelConfig,
                      cache_config: Optional[CacheConfig] = None) -> "EngineConfig":
