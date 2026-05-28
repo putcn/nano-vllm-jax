@@ -1,6 +1,6 @@
 """Sampling parameters (JAX port of nanovllm/sampling_params.py)."""
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
 
 
 @dataclass
@@ -13,11 +13,7 @@ class SamplingParams:
     ignore_eos: bool = False
 
     def __post_init__(self):
-        if self.temperature < 0:
-            raise ValueError(f"temperature must be >= 0, got {self.temperature}")
-        if self.top_p <= 0:
-            raise ValueError(f"top_p must be > 0, got {self.top_p}")
-        if self.top_k < 0:
-            raise ValueError(f"top_k must be >= 0, got {self.top_k}")
-        if self.max_tokens < 1:
-            raise ValueError(f"max_tokens must be >= 1, got {self.max_tokens}")
+        assert self.temperature >= 0, f"temperature must be >= 0, got {self.temperature}"
+        assert 0 < self.top_p <= 1.0, f"top_p must be in (0, 1], got {self.top_p}"
+        assert self.top_k >= 0, f"top_k must be >= 0, got {self.top_k}"
+        assert self.max_tokens >= 1, f"max_tokens must be >= 1, got {self.max_tokens}"
