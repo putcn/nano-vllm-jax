@@ -17,6 +17,19 @@ Two construction modes
            block_size=8,
        )
 
+JIT strategy
+------------
+JAX traces and compiles a new XLA program whenever array *shapes* change.
+To avoid recompilation every decode step we **pad all inputs to the next
+power-of-two size** before calling the JIT'd forward function, so the GPU
+sees only O(log N) distinct shapes in practice.
+
+- ``_jit_prefill(model, kv_cache, ids, pos, bi, bo, seq_lens)``
+  Padded to the next power-of-two token count.
+
+- ``_jit_decode(model, kv_cache, ids, pos, bi, bo, seq_lens, block_table)``
+  Padded to the next power-of-two batch size and block-table width.
+
 Public helpers
 --------------
 - ``_build_prefill_inputs(seqs)``  →  (seqs, ids, pos, bi, bo, seq_lens, last_indices)
@@ -24,6 +37,7 @@ Public helpers
 - ``run(prefill_seqs, decode_seqs)`` →  {seq_id: next_token_id}
 """
 from __future__ import annotations
+import functools
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -32,6 +46,20 @@ if TYPE_CHECKING:
     from nanovllm_jax.layers.attention import PagedKVCache
 
 from nanovllm_jax.engine.sequence import Sequence
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _next_pow2(n: int) -> int:
+    """Smallest power of 2 >= n (minimum 1)."""
+    if n <= 1:
+        return 1
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +82,33 @@ class _StubModel:
 
     def load_weights(self, params):
         pass
+
+
+# ---------------------------------------------------------------------------
+# JIT-compiled forward functions
+# ---------------------------------------------------------------------------
+# We use module-level @functools.partial(jax.jit) functions rather than
+# methods so that JAX can trace them cleanly without capturing `self`.
+# The model and kv_cache are passed as regular arguments; JAX traces on
+# their *structure* (pytree) and recompiles only when shapes change.
+
+import jax
+import jax.numpy as jnp
+
+
+@functools.partial(jax.jit, static_argnums=())
+def _jit_prefill(model, kv_cache, ids, pos, bi, bo, seq_lens):
+    """JIT-compiled prefill forward pass. Returns full logit matrix."""
+    return model(ids, pos, kv_cache, bi, bo, seq_lens, is_prefill=True)
+
+
+@functools.partial(jax.jit, static_argnums=())
+def _jit_decode(model, kv_cache, ids, pos, bi, bo, seq_lens, block_table):
+    """JIT-compiled decode forward pass. Returns full logit matrix."""
+    return model(
+        ids, pos, kv_cache, bi, bo, seq_lens,
+        is_prefill=False, block_table=block_table,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +174,6 @@ class ModelRunner:
             self._model = _StubModel()
 
     def _init_kv_cache_stub(self):
-        import jax.numpy as jnp
         from nanovllm_jax.layers.attention import PagedKVCache
         cfg = self.config
         self._kv_cache = PagedKVCache(
@@ -129,7 +183,6 @@ class ModelRunner:
         )
 
     def _load_real_model(self):
-        import jax.numpy as jnp
         from nanovllm_jax.loader.model_registry import load_model
         from nanovllm_jax.layers.attention import PagedKVCache
         cfg = self.config
@@ -144,6 +197,21 @@ class ModelRunner:
             dtype=jnp.bfloat16 if cfg.dtype == "bfloat16" else jnp.float32,
         )
 
+    # ---- padding helpers ------------------------------------------------
+
+    @staticmethod
+    def _pad1d(arr, target_len: int, val: int = 0):
+        """Pad a 1-D int array to target_len."""
+        pad = target_len - arr.shape[0]
+        return jnp.pad(arr, (0, pad), constant_values=val)
+
+    @staticmethod
+    def _pad2d(arr, target_rows: int, target_cols: int, val: int = 0):
+        """Pad a 2-D int array to (target_rows, target_cols)."""
+        pr = target_rows - arr.shape[0]
+        pc = target_cols - arr.shape[1]
+        return jnp.pad(arr, ((0, pr), (0, pc)), constant_values=val)
+
     # ---- input builders -------------------------------------------------
 
     def _build_prefill_inputs(self, seqs: List[Sequence]) -> Tuple:
@@ -153,7 +221,6 @@ class ModelRunner:
             (seqs, token_ids, positions, block_indices, block_offsets,
              seq_lens, last_indices)
         """
-        import jax.numpy as jnp
         all_ids: List[int] = []
         all_pos: List[int] = []
         all_bi:  List[int] = []
@@ -193,7 +260,6 @@ class ModelRunner:
 
         block_table is 2-D int32 [B, max_blocks], padded with 0.
         """
-        import jax.numpy as jnp
         ids:   List[int] = []
         pos:   List[int] = []
         bi:    List[int] = []
@@ -235,22 +301,48 @@ class ModelRunner:
         return results
 
     def _run_prefill(self, seqs: List[Sequence]) -> Dict[int, int]:
-        import jax.numpy as jnp
         self._ensure_model()
         if isinstance(self._model, _StubModel):
             return {seq.seq_id: self._model.eos_token_id for seq in seqs}
+
         _, ids, pos, bi, bo, seq_lens, last_idx = self._build_prefill_inputs(seqs)
-        logits = self._model(ids, pos, self._kv_cache, bi, bo, seq_lens, is_prefill=True)
+
+        # Pad token dimension to next power-of-2 to minimise JIT recompilation.
+        T = ids.shape[0]
+        T_pad = _next_pow2(T)
+        if T_pad != T:
+            ids     = self._pad1d(ids,  T_pad)
+            pos     = self._pad1d(pos,  T_pad)
+            bi      = self._pad1d(bi,   T_pad)
+            bo      = self._pad1d(bo,   T_pad)
+
+        logits = _jit_prefill(self._model, self._kv_cache, ids, pos, bi, bo, seq_lens)
+        # logits shape: [T_pad, vocab] — read only at the real last-token positions
         return {seq.seq_id: int(jnp.argmax(logits[last_idx[i]])) for i, seq in enumerate(seqs)}
 
     def _run_decode(self, seqs: List[Sequence]) -> Dict[int, int]:
-        import jax.numpy as jnp
         self._ensure_model()
         if isinstance(self._model, _StubModel):
             return {seq.seq_id: self._model.eos_token_id for seq in seqs}
+
         _, ids, pos, bi, bo, seq_lens, block_table = self._build_decode_inputs(seqs)
-        logits = self._model(
-            ids, pos, self._kv_cache, bi, bo, seq_lens,
-            is_prefill=False, block_table=block_table,
+
+        # Pad batch and block-table width to next power-of-2.
+        B  = ids.shape[0]
+        BT = block_table.shape[1]
+        B_pad  = _next_pow2(B)
+        BT_pad = _next_pow2(BT)
+        if B_pad != B or BT_pad != BT:
+            ids         = self._pad1d(ids,   B_pad)
+            pos         = self._pad1d(pos,   B_pad)
+            bi          = self._pad1d(bi,    B_pad)
+            bo          = self._pad1d(bo,    B_pad)
+            seq_lens    = self._pad1d(seq_lens, B_pad, val=1)  # avoid div-by-zero
+            block_table = self._pad2d(block_table, B_pad, BT_pad)
+
+        logits = _jit_decode(
+            self._model, self._kv_cache,
+            ids, pos, bi, bo, seq_lens, block_table,
         )
+        # logits shape: [B_pad, vocab] — read only the first B real rows
         return {seq.seq_id: int(jnp.argmax(logits[i])) for i, seq in enumerate(seqs)}
