@@ -9,6 +9,13 @@ Design notes vs PyTorch original:
   _decode (single-step KV lookup) based on is_prefill flag.
 - No flash-attention yet — plain scaled dot-product in float32.
   Flash attention (via jax.nn.dot_product_attention) is Phase 6.
+
+Padding contract
+----------------
+model_runner pads all arrays to power-of-2 shapes for JIT stability.  To
+avoid polluting the KV cache with garbage from padded slots we pass the
+*real* counts (num_real_tokens for prefill, num_real_seqs for decode) into
+the Attention layer so writes and reads are bounded to real data only.
 """
 from __future__ import annotations
 from typing import Optional
@@ -51,7 +58,6 @@ class PagedKVCache(nnx.Module):
         self.num_blocks = num_blocks
         self.block_size = block_size
         self.dtype = dtype
-        # Shape: [num_layers, 2, num_blocks, block_size, num_kv_heads, head_dim]
         cache = jnp.zeros(
             (num_layers, 2, num_blocks, block_size, num_kv_heads, head_dim),
             dtype=dtype,
@@ -61,29 +67,18 @@ class PagedKVCache(nnx.Module):
     def write(
         self,
         layer_idx: int,
-        block_indices: jax.Array,   # (num_tokens,) int32 — block id per token
-        block_offsets: jax.Array,   # (num_tokens,) int32 — offset within block
-        keys: jax.Array,            # (num_tokens, num_kv_heads, head_dim)
-        values: jax.Array,          # (num_tokens, num_kv_heads, head_dim)
+        block_indices: jax.Array,   # (num_real_tokens,) int32
+        block_offsets: jax.Array,   # (num_real_tokens,) int32
+        keys: jax.Array,            # (num_real_tokens, num_kv_heads, head_dim)
+        values: jax.Array,          # (num_real_tokens, num_kv_heads, head_dim)
     ) -> None:
-        """Write a batch of tokens into the cache (prefill or decode)."""
+        """Write *real* tokens into the cache.
+
+        Caller must slice arrays to real token count before calling;
+        padding tokens must NOT be included to avoid cache corruption.
+        """
         cache = self.cache.get_value()
-
-        def write_one(carry, x):
-            c, bi, bo, k, v = carry, x[0], x[1], x[2], x[3]
-            c = c.at[layer_idx, 0, bi, bo].set(k.astype(self.dtype))
-            c = c.at[layer_idx, 1, bi, bo].set(v.astype(self.dtype))
-            return c, None
-
-        # xs: (num_tokens, 2 + 2*num_kv_heads*head_dim) — pack indices + kv
-        # Use vmap-style scan to stay jit-friendly
-        tokens = keys.shape[0]
-        new_cache = cache
-        # Python loop is fine here — jit will unroll for small token counts;
-        # for large prefills Phase 6 will switch to scatter_nd.
-        # For now use lax.fori_loop to keep it jit-compilable.
-        kv_heads = keys.shape[1]
-        hd = keys.shape[2]
+        num_real = keys.shape[0]
 
         def body(i, c):
             bi = block_indices[i]
@@ -92,37 +87,35 @@ class PagedKVCache(nnx.Module):
             c = c.at[layer_idx, 1, bi, bo].set(values[i].astype(self.dtype))
             return c
 
-        new_cache = jax.lax.fori_loop(0, tokens, body, new_cache)
+        new_cache = jax.lax.fori_loop(0, num_real, body, cache)
         self.cache = nnx.Variable(new_cache)
 
     def read(
         self,
         layer_idx: int,
-        block_table: jax.Array,   # (num_seqs, max_blocks_per_seq) int32
-        seq_lens: jax.Array,      # (num_seqs,) int32
+        block_table: jax.Array,   # (num_real_seqs, max_blocks_per_seq) int32
+        seq_lens: jax.Array,      # (num_real_seqs,) int32
     ) -> tuple[jax.Array, jax.Array]:
-        """Read all cached KV for each sequence (decode step).
+        """Read all cached KV for each *real* sequence (decode step).
+
+        Caller must pass only real sequences; padded rows must be excluded.
 
         Returns:
-            keys:   (num_seqs, max_seq_len, num_kv_heads, head_dim)
-            values: (num_seqs, max_seq_len, num_kv_heads, head_dim)
+            keys:   (num_real_seqs, max_seq_len, num_kv_heads, head_dim)
+            values: (num_real_seqs, max_seq_len, num_kv_heads, head_dim)
         """
         cache = self.cache.get_value()
-        num_seqs, max_blocks = block_table.shape
-        max_seq_len = max_blocks * self.block_size
-
-        # Gather all blocks for every sequence
-        # cache[layer, kv, block, offset, head, dim]
         k_cache = cache[layer_idx, 0]  # (num_blocks, block_size, kv_heads, head_dim)
         v_cache = cache[layer_idx, 1]
 
-        # (num_seqs, max_blocks, block_size, kv_heads, head_dim)
-        k_gathered = k_cache[block_table]  # fancy index over block dim
+        # (num_real_seqs, max_blocks, block_size, kv_heads, head_dim)
+        k_gathered = k_cache[block_table]
         v_gathered = v_cache[block_table]
 
-        # Reshape to (num_seqs, max_seq_len, kv_heads, head_dim)
-        k_out = k_gathered.reshape(num_seqs, max_seq_len, self.num_kv_heads, self.head_dim)
-        v_out = v_gathered.reshape(num_seqs, max_seq_len, self.num_kv_heads, self.head_dim)
+        num_real_seqs = block_table.shape[0]
+        max_seq_len   = block_table.shape[1] * self.block_size
+        k_out = k_gathered.reshape(num_real_seqs, max_seq_len, self.num_kv_heads, self.head_dim)
+        v_out = v_gathered.reshape(num_real_seqs, max_seq_len, self.num_kv_heads, self.head_dim)
         return k_out.astype(jnp.float32), v_out.astype(jnp.float32)
 
 
@@ -149,12 +142,12 @@ class Attention(nnx.Module):
         layer_idx: int = 0,
         scale: Optional[float] = None,
     ) -> None:
-        self.num_heads = num_heads
-        self.head_dim = head_dim
+        self.num_heads    = num_heads
+        self.head_dim     = head_dim
         self.num_kv_heads = num_kv_heads or num_heads
-        self.layer_idx = layer_idx
-        self.scale = scale or (head_dim ** -0.5)
-        self.kv_groups = self.num_heads // self.num_kv_heads  # GQA repeat factor
+        self.layer_idx    = layer_idx
+        self.scale        = scale or (head_dim ** -0.5)
+        self.kv_groups    = self.num_heads // self.num_kv_heads
 
     # ------------------------------------------------------------------
     # Prefill: full causal attention over a packed token sequence
@@ -162,37 +155,28 @@ class Attention(nnx.Module):
 
     def _prefill(
         self,
-        q: jax.Array,   # (total_tokens, num_heads, head_dim)
-        k: jax.Array,   # (total_tokens, num_kv_heads, head_dim)
-        v: jax.Array,   # (total_tokens, num_kv_heads, head_dim)
+        q: jax.Array,         # (total_tokens, num_heads, head_dim)
+        k: jax.Array,         # (total_tokens, num_kv_heads, head_dim)
+        v: jax.Array,         # (total_tokens, num_kv_heads, head_dim)
         seq_lens: jax.Array,  # (num_seqs,) int32
-    ) -> jax.Array:     # (total_tokens, num_heads, head_dim)
-        """Causal self-attention for prefill.
-
-        For simplicity, treats the whole batch as one sequence with a
-        block-diagonal causal mask.  Phase 6 replaces this with
-        flash-attention / varlen kernels.
-        """
+    ) -> jax.Array:           # (total_tokens, num_heads, head_dim)
+        """Causal self-attention for prefill (real tokens only)."""
         T = q.shape[0]
-        # GQA: repeat KV heads to match Q heads
         if self.kv_groups > 1:
-            k = jnp.repeat(k, self.kv_groups, axis=1)  # (T, num_heads, head_dim)
+            k = jnp.repeat(k, self.kv_groups, axis=1)
             v = jnp.repeat(v, self.kv_groups, axis=1)
 
-        # (T, num_heads, T) attention logits
-        # q: (T, H, D) -> (H, T, D); k: (T, H, D) -> (H, D, T)
         q_t = jnp.transpose(q, (1, 0, 2))  # (H, T, D)
         k_t = jnp.transpose(k, (1, 2, 0))  # (H, D, T)
         logits = jnp.matmul(q_t, k_t) * self.scale  # (H, T, T)
 
-        # Causal mask: token i can only attend to tokens j <= i
         mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
         logits = jnp.where(mask[None, :, :], logits, jnp.finfo(jnp.float32).min)
 
-        attn = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
-        v_t = jnp.transpose(v, (1, 0, 2))  # (H, T, D)
-        out = jnp.matmul(attn, v_t)        # (H, T, D)
-        return jnp.transpose(out, (1, 0, 2))  # (T, H, D)
+        attn  = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
+        v_t   = jnp.transpose(v, (1, 0, 2))   # (H, T, D)
+        out   = jnp.matmul(attn, v_t)          # (H, T, D)
+        return jnp.transpose(out, (1, 0, 2))   # (T, H, D)
 
     # ------------------------------------------------------------------
     # Decode: single new token per sequence, KV from paged cache
@@ -200,60 +184,90 @@ class Attention(nnx.Module):
 
     def _decode(
         self,
-        q: jax.Array,             # (num_seqs, num_heads, head_dim)
-        k_cache: jax.Array,       # (num_seqs, ctx_len, num_kv_heads, head_dim)
-        v_cache: jax.Array,       # (num_seqs, ctx_len, num_kv_heads, head_dim)
-        seq_lens: jax.Array,      # (num_seqs,) int32 — actual context length
-    ) -> jax.Array:               # (num_seqs, num_heads, head_dim)
-        """Attention for the decode step (one new token per sequence)."""
-        num_seqs, ctx_len = k_cache.shape[0], k_cache.shape[1]
+        q: jax.Array,         # (num_seqs, num_heads, head_dim)
+        k_cache: jax.Array,   # (num_seqs, ctx_len, num_kv_heads, head_dim)
+        v_cache: jax.Array,   # (num_seqs, ctx_len, num_kv_heads, head_dim)
+        seq_lens: jax.Array,  # (num_seqs,) int32 — actual context length
+    ) -> jax.Array:           # (num_seqs, num_heads, head_dim)
+        """Attention for the decode step (one new token per *real* sequence)."""
+        ctx_len = k_cache.shape[1]
 
-        # GQA expand
         if self.kv_groups > 1:
             k_cache = jnp.repeat(k_cache, self.kv_groups, axis=2)
             v_cache = jnp.repeat(v_cache, self.kv_groups, axis=2)
 
-        # q: (S, H, D) -> (S, H, 1, D)
-        q_e = q[:, :, None, :]  # (S, H, 1, D)
-        # k_cache: (S, ctx, H, D) -> (S, H, D, ctx)
-        k_t = jnp.transpose(k_cache, (0, 2, 3, 1))  # (S, H, D, ctx)
-        # logits: (S, H, 1, ctx)
-        logits = jnp.matmul(q_e, k_t) * self.scale  # (S, H, 1, ctx)
+        q_e    = q[:, :, None, :]                        # (S, H, 1, D)
+        k_t    = jnp.transpose(k_cache, (0, 2, 3, 1))   # (S, H, D, ctx)
+        logits = jnp.matmul(q_e, k_t) * self.scale      # (S, H, 1, ctx)
 
-        # Mask padding positions
+        # Mask positions beyond each sequence's real length
         positions = jnp.arange(ctx_len)[None, None, None, :]  # (1,1,1,ctx)
-        valid = positions < seq_lens[:, None, None, None]      # (S,1,1,ctx)
+        valid  = positions < seq_lens[:, None, None, None]     # (S,1,1,ctx)
         logits = jnp.where(valid, logits, jnp.finfo(jnp.float32).min)
 
         attn = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)  # (S,H,1,ctx)
-
-        # v_cache: (S, ctx, H, D) -> (S, H, ctx, D)
-        v_t = jnp.transpose(v_cache, (0, 2, 1, 3))  # (S, H, ctx, D)
-        out = jnp.matmul(attn, v_t)                  # (S, H, 1, D)
-        return out[:, :, 0, :]                        # (S, H, D)
+        v_t  = jnp.transpose(v_cache, (0, 2, 1, 3))                 # (S,H,ctx,D)
+        out  = jnp.matmul(attn, v_t)                                 # (S,H,1,D)
+        return out[:, :, 0, :]                                       # (S,H,D)
 
     # ------------------------------------------------------------------
-    # Public forward — writes new KV into cache, returns attended output
+    # Public forward
     # ------------------------------------------------------------------
 
     def __call__(
         self,
-        q: jax.Array,               # (T, num_heads, head_dim)
-        k: jax.Array,               # (T, num_kv_heads, head_dim)
-        v: jax.Array,               # (T, num_kv_heads, head_dim)
+        q: jax.Array,               # (T_pad, num_heads, head_dim)
+        k: jax.Array,               # (T_pad, num_kv_heads, head_dim)
+        v: jax.Array,               # (T_pad, num_kv_heads, head_dim)
         kv_cache: PagedKVCache,
-        block_indices: jax.Array,   # (T,) int32
-        block_offsets: jax.Array,   # (T,) int32
-        seq_lens: jax.Array,        # (num_seqs,) int32
+        block_indices: jax.Array,   # (T_pad,) int32
+        block_offsets: jax.Array,   # (T_pad,) int32
+        seq_lens: jax.Array,        # (num_real_seqs,) int32
         is_prefill: bool,
-        block_table: Optional[jax.Array] = None,  # (num_seqs, max_blocks) for decode
+        block_table: Optional[jax.Array] = None,  # (num_real_seqs, max_blocks)
+        num_real_tokens: Optional[int] = None,    # prefill: real token count
+        num_real_seqs: Optional[int] = None,      # decode:  real seq count
     ) -> jax.Array:
-        # Write new tokens into cache
-        kv_cache.write(self.layer_idx, block_indices, block_offsets, k, v)
+        """Write new KV into cache (real tokens only), then compute attention.
 
+        num_real_tokens / num_real_seqs are Python ints so JIT can use them
+        as compile-time slice bounds without tracing through the values.
+        """
         if is_prefill:
-            return self._prefill(q, k, v, seq_lens)
+            T_real = num_real_tokens if num_real_tokens is not None else q.shape[0]
+            # Write only real tokens to avoid cache corruption from padding
+            kv_cache.write(
+                self.layer_idx,
+                block_indices[:T_real],
+                block_offsets[:T_real],
+                k[:T_real],
+                v[:T_real],
+            )
+            return self._prefill(q[:T_real], k[:T_real], v[:T_real], seq_lens)
         else:
             assert block_table is not None
-            k_ctx, v_ctx = kv_cache.read(self.layer_idx, block_table, seq_lens)
-            return self._decode(q, k_ctx, v_ctx, seq_lens)
+            B_real = num_real_seqs if num_real_seqs is not None else q.shape[0]
+            # Write the new decode token for each real sequence only
+            kv_cache.write(
+                self.layer_idx,
+                block_indices[:B_real],
+                block_offsets[:B_real],
+                k[:B_real],
+                v[:B_real],
+            )
+            # Read KV history for real sequences only
+            k_ctx, v_ctx = kv_cache.read(
+                self.layer_idx,
+                block_table[:B_real],
+                seq_lens[:B_real],
+            )
+            out_real = self._decode(q[:B_real], k_ctx, v_ctx, seq_lens[:B_real])
+            # Pad output back to B_pad so downstream shapes stay consistent
+            B_pad = q.shape[0]
+            if B_real < B_pad:
+                pad = jnp.zeros(
+                    (B_pad - B_real, self.num_heads, self.head_dim),
+                    dtype=out_real.dtype,
+                )
+                out_real = jnp.concatenate([out_real, pad], axis=0)
+            return out_real
