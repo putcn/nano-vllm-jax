@@ -18,13 +18,7 @@ from nanovllm_jax.layers.embed_head import ParallelLMHead, VocabParallelEmbeddin
 
 
 def test_lm_head_last_indices_selects_correct_token():
-    """ParallelLMHead with last_indices must return logits for the correct rows.
-
-    We compare against hidden[idx] @ head.effective_weight.T (not the raw `w`
-    passed to load_weight) because nnx.Param may store a copy with a slightly
-    different layout. Both paths go through the same weight array, so any
-    difference between logits_with[i] and expected is purely row-selection error.
-    """
+    """ParallelLMHead with last_indices must return logits for the correct rows."""
     vocab_size = 16
     hidden_size = 8
     num_seqs = 3
@@ -42,9 +36,9 @@ def test_lm_head_last_indices_selects_correct_token():
         f"Expected ({num_seqs}, {vocab_size}), got {logits_with.shape}"
     )
 
-    # Use effective_weight as reference so both sides go through the same
-    # weight array; this isolates row-selection correctness.
-    ew = head.effective_weight  # shape (vocab_size, hidden_size)
+    # Both sides use the same effective_weight array so the only difference
+    # can be wrong row selection, not weight round-trip artefacts.
+    ew = head.effective_weight  # plain jax.Array, shape (vocab_size, hidden_size)
     for i, idx in enumerate([2, 5, 11]):
         expected = hidden[idx] @ ew.T
         assert jnp.allclose(logits_with[i], expected, atol=1e-5), (
