@@ -53,13 +53,13 @@ class TestKVCacheWrite:
     def test_write_real_tokens_only(self, kv_cache):
         """Writing 2 real tokens must not touch blocks used by other sequences."""
         num_real = 2
-        bi = jnp.array([0, 0], dtype=jnp.int32)   # block 0
-        bo = jnp.array([0, 1], dtype=jnp.int32)   # offsets 0,1
+        bi = jnp.array([0, 0], dtype=jnp.int32)
+        bo = jnp.array([0, 1], dtype=jnp.int32)
         k  = jnp.ones((num_real, NUM_KV_HEADS, HEAD_DIM), dtype=jnp.float32)
         v  = jnp.ones((num_real, NUM_KV_HEADS, HEAD_DIM), dtype=jnp.float32) * 2.0
 
         kv_cache.write(0, bi, bo, k, v)
-        cache = kv_cache.cache.value
+        cache = kv_cache.cache.get_value()
 
         # Block 0, offsets 0-1 should be written
         assert jnp.allclose(cache[0, 0, 0, 0], 1.0)
@@ -70,25 +70,21 @@ class TestKVCacheWrite:
         assert jnp.allclose(cache[0, 0, 1], 0.0)
 
     def test_padding_tokens_excluded(self, kv_cache):
-        """Caller must NOT pass padding tokens — verify block 0 is not overwritten."""
-        # First write real data into block 0 offset 0
+        """Verify block 0 offset 0 is not overwritten by a subsequent write."""
         bi_real = jnp.array([0], dtype=jnp.int32)
         bo_real = jnp.array([0], dtype=jnp.int32)
         k_real  = jnp.ones((1, NUM_KV_HEADS, HEAD_DIM)) * 99.0
         v_real  = jnp.ones((1, NUM_KV_HEADS, HEAD_DIM)) * 99.0
         kv_cache.write(0, bi_real, bo_real, k_real, v_real)
 
-        # Now write a padding token also at block 0 offset 1
         bi_pad = jnp.array([0], dtype=jnp.int32)
         bo_pad = jnp.array([1], dtype=jnp.int32)
         k_pad  = jnp.ones((1, NUM_KV_HEADS, HEAD_DIM)) * -1.0
         v_pad  = jnp.ones((1, NUM_KV_HEADS, HEAD_DIM)) * -1.0
         kv_cache.write(0, bi_pad, bo_pad, k_pad, v_pad)
 
-        cache = kv_cache.cache.value
-        # Real slot must be untouched
+        cache = kv_cache.cache.get_value()
         assert jnp.allclose(cache[0, 0, 0, 0], 99.0)
-        # Padding slot was written separately
         assert jnp.allclose(cache[0, 0, 0, 1], -1.0)
 
 
@@ -98,7 +94,7 @@ class TestKVCacheWrite:
 
 class TestKVCacheRead:
     def test_read_returns_correct_shape(self, kv_cache):
-        num_seqs  = 2
+        num_seqs   = 2
         max_blocks = 2
         block_table = jnp.zeros((num_seqs, max_blocks), dtype=jnp.int32)
         seq_lens    = jnp.array([3, 2], dtype=jnp.int32)
@@ -109,7 +105,6 @@ class TestKVCacheRead:
 
     def test_read_isolates_sequences(self, kv_cache):
         """Two sequences using different blocks must read independent KV."""
-        # Write distinctive values into block 0 and block 1
         bi0 = jnp.array([0], dtype=jnp.int32)
         bi1 = jnp.array([1], dtype=jnp.int32)
         bo  = jnp.array([0], dtype=jnp.int32)
@@ -120,7 +115,6 @@ class TestKVCacheRead:
                        jnp.ones((1, NUM_KV_HEADS, HEAD_DIM)) * 2.0,
                        jnp.ones((1, NUM_KV_HEADS, HEAD_DIM)) * 2.0)
 
-        # seq 0 uses block 0; seq 1 uses block 1
         block_table = jnp.array([[0, 0], [1, 1]], dtype=jnp.int32)
         seq_lens    = jnp.array([1, 1], dtype=jnp.int32)
         k_out, _ = kv_cache.read(0, block_table, seq_lens)
@@ -146,7 +140,6 @@ class TestAttentionPrefill:
 
         out = attn(q, k, v, kv_cache, bi, bo, seq_lens,
                    is_prefill=True, num_real_tokens=T_real)
-        # Output shape should match real tokens only
         assert out.shape == (T_real, NUM_HEADS, HEAD_DIM)
 
     def test_prefill_does_not_write_padding(self, kv_cache):
@@ -156,8 +149,6 @@ class TestAttentionPrefill:
         q  = jnp.ones((T_pad, NUM_HEADS,    HEAD_DIM))
         k  = jnp.ones((T_pad, NUM_KV_HEADS, HEAD_DIM))
         v  = jnp.ones((T_pad, NUM_KV_HEADS, HEAD_DIM))
-        # Real tokens go to block 0, offsets 0-1
-        # Padding tokens would go to offsets 2-3 of block 0
         bi = jnp.array([0, 0, 0, 0], dtype=jnp.int32)
         bo = jnp.array([0, 1, 2, 3], dtype=jnp.int32)
         seq_lens = jnp.array([T_real], dtype=jnp.int32)
@@ -165,11 +156,9 @@ class TestAttentionPrefill:
         attn_layer(q, k, v, kv_cache, bi, bo, seq_lens,
                    is_prefill=True, num_real_tokens=T_real)
 
-        cache = kv_cache.cache.value
-        # Offsets 0-1 (real) should be non-zero
+        cache = kv_cache.cache.get_value()
         assert not jnp.allclose(cache[0, 0, 0, 0], 0.0)
         assert not jnp.allclose(cache[0, 0, 0, 1], 0.0)
-        # Offsets 2-3 (padding) must remain zero
         assert jnp.allclose(cache[0, 0, 0, 2], 0.0), "padding wrote to cache!"
         assert jnp.allclose(cache[0, 0, 0, 3], 0.0), "padding wrote to cache!"
 
@@ -212,7 +201,6 @@ class TestAttentionDecode:
                    is_prefill=False,
                    block_table=block_table,
                    num_real_seqs=B_real)
-        # Padded rows [1:] must be all zeros
         assert jnp.allclose(out[1:], 0.0), "padded rows should be zero"
 
     def test_decode_sequences_independent(self):
@@ -223,7 +211,6 @@ class TestAttentionDecode:
         )
         attn_layer = Attention(num_heads=1, head_dim=4, num_kv_heads=1, layer_idx=0)
 
-        # Pre-fill block 0 with value 1.0, block 1 with value 2.0
         cache.write(0,
                     jnp.array([0], dtype=jnp.int32),
                     jnp.array([0], dtype=jnp.int32),
@@ -239,7 +226,7 @@ class TestAttentionDecode:
         q  = jnp.ones((B_real, 1, 4))
         k  = jnp.zeros((B_real, 1, 4))
         v  = jnp.zeros((B_real, 1, 4))
-        bi = jnp.array([0, 1], dtype=jnp.int32)  # decode token goes to new slot
+        bi = jnp.array([0, 1], dtype=jnp.int32)
         bo = jnp.array([1, 1], dtype=jnp.int32)
         seq_lens    = jnp.array([2, 2], dtype=jnp.int32)
         block_table = jnp.array([[0, 0], [1, 1]], dtype=jnp.int32)
@@ -248,6 +235,5 @@ class TestAttentionDecode:
                          is_prefill=False,
                          block_table=block_table,
                          num_real_seqs=B_real)
-        # The two sequences read different blocks so outputs must differ
         assert not jnp.allclose(out[0], out[1]), \
             "sequences should have independent outputs"

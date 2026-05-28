@@ -13,15 +13,23 @@ import numpy as np
 from nanovllm_jax.engine.model_runner import ModelRunner, _next_pow2
 from nanovllm_jax.engine.sequence import Sequence
 from nanovllm_jax.layers.attention import PagedKVCache
+from nanovllm_jax.sampling_params import SamplingParams
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+_SP = SamplingParams(temperature=0.0, max_tokens=32)
+
+
 def _make_seq(seq_id: int, token_ids: list, block_table: list) -> Sequence:
-    seq = Sequence(seq_id=seq_id, token_ids=token_ids)
-    seq.block_table = block_table
+    seq = Sequence(
+        seq_id=seq_id,
+        prompt_token_ids=token_ids,
+        sampling_params=_SP,
+        block_table=block_table,
+    )
     return seq
 
 
@@ -78,15 +86,13 @@ class TestBuildPrefillInputs:
 class TestBuildDecodeInputs:
     def test_single_seq(self):
         runner = _make_runner_with_stub(block_size=4)
-        # seq has 5 tokens -> step=4 -> block 1, offset 0
-        seq = _make_seq(7, list(range(5)), block_table=[0, 1])
-        seq._last_token_id = 99  # set via attribute for test
-        # Patch last_token_id property
-        seq.last_token_id = 99
+        # seq has 5 tokens (3 prompt + 2 output) -> step=4 -> block 1, offset 0
+        seq = _make_seq(7, [1, 2, 3], block_table=[0, 1])
+        seq.output_token_ids = [4, 5]
         _, ids, pos, bi, bo, slens, block_table = runner._build_decode_inputs([seq])
 
         assert ids.shape == (1,)
-        assert pos.tolist() == [4]      # step = total_len - 1
+        assert pos.tolist() == [4]      # step = total_len - 1 = 5 - 1
         assert slens.tolist() == [5]
         assert block_table.shape == (1, 2)
 
@@ -107,13 +113,12 @@ class TestRunWithStub:
     def test_decode_returns_eos(self):
         runner = _make_runner_with_stub()
         seq = _make_seq(2, [10, 20, 30], block_table=[0])
-        seq.last_token_id = 30
         results = runner.run([], [seq])
         assert 2 in results
         assert results[2] == 2
 
     def test_multi_seq_all_ids_returned(self):
         runner = _make_runner_with_stub()
-        seqs = [_make_seq(i, [i * 10], block_table=[i]) for i in range(3)]
+        seqs = [_make_seq(i, [i * 10 + 1], block_table=[i]) for i in range(3)]
         results = runner.run(seqs, [])
         assert set(results.keys()) == {0, 1, 2}
