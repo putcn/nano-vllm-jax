@@ -28,19 +28,13 @@ class VocabParallelEmbedding(nnx.Module):
         self.weight = nnx.Param(jnp.zeros((self.num_embeddings_per_partition, embedding_dim)))
 
     def load_weight(self, weight: jax.Array) -> None:
-        # jnp.asarray avoids an unnecessary buffer copy while still
-        # materialising any lazy computation in the slice.
         arr = jnp.asarray(weight[self.vocab_start_idx:self.vocab_end_idx, :])
         self.weight = nnx.Param(arr)
 
     @property
     def weight_array(self) -> jax.Array:
         """Return the underlying weight as a plain jax.Array."""
-        w = self.weight
-        # nnx.Param exposes the array via .value (all Flax versions)
-        if hasattr(w, 'value'):
-            return w.value
-        return jnp.asarray(w)
+        return self.weight[...]
 
     def __call__(self, x: jax.Array) -> jax.Array:
         w = self.weight_array
@@ -87,16 +81,14 @@ class ParallelLMHead(nnx.Module):
             tied = tied.value
         if tied is not None:
             return tied.weight_array
-        w = self.weight
-        if hasattr(w, 'value'):
-            return w.value
-        return jnp.asarray(w)
+        return self.weight[...]
 
     def __call__(
         self,
         x: jax.Array,
         last_indices: Optional[jax.Array] = None,
     ) -> jax.Array:
+        ew = self.effective_weight
         if last_indices is not None:
             x = x[last_indices]
-        return x @ self.effective_weight.T
+        return x @ ew.T
