@@ -1,22 +1,19 @@
 """Token embedding and LM head (JAX port of nanovllm/layers/embed_head.py).
 
-Status: ✅ Fixed (weight tying: store embed as NNX submodule, not nnx.data)
+Status: ✅ Fixed (weight tying: nnx.data slot + get_raw_value() unwrap)
 
-Root cause of garbled output
------------------------------
-Previously ``_tied_embed`` was stored via ``nnx.data(embed)``.  Reading it
-back required ``tied.value``, but ``.value`` is deprecated in current Flax
-and silently returns ``None``.  This caused ``effective_weight`` to fall
-through to the zero-initialised ``self.weight``, making every logit ~0 and
-producing garbage predictions (repeating "Question / Instructions" loop).
-
-Fix
----
-Store ``VocabParallelEmbedding`` directly as ``self._tied_embed`` (a plain
-NNX submodule reference).  Flax NNX Pytree machinery handles nested Module
-references natively — no ``nnx.data()`` wrapper is needed or correct here.
-``effective_weight`` now checks ``self._tied_embed is not None`` and calls
-``self._tied_embed.weight_array`` directly.
+Weight tying rules for Flax NNX
+--------------------------------
+1. The slot must be initialised as ``nnx.data(None)`` in ``__init__`` so
+   Flax marks it as a *data* attribute (not static).  Assigning a bare
+   Module to a slot initialised as ``None`` (static) raises ValueError.
+2. ``tie_weights`` wraps the embed module with ``nnx.data(embed)`` to keep
+   the slot type consistent with the initial ``nnx.data(None)``.
+3. ``effective_weight`` unwraps via ``get_raw_value()`` — the canonical
+   non-deprecated accessor (as flagged by the DeprecationWarning for
+   ``.raw_value``).  The old ``.value`` accessor silently returned ``None``
+   in current Flax, causing lm_head to fall back to zero-initialised
+   weights and produce garbage predictions for Qwen3.
 """
 from __future__ import annotations
 from typing import Optional
@@ -88,18 +85,17 @@ class ParallelLMHead(nnx.Module):
         self.tp_rank = tp_rank
         self.num_embeddings_per_partition = num_embeddings // tp_size
         self.weight = nnx.Param(jnp.zeros((self.num_embeddings_per_partition, embedding_dim)))
-        # None sentinel: no tied embedding yet.
-        # Assigned to a VocabParallelEmbedding instance in tie_weights().
-        # Stored directly as an NNX submodule — no nnx.data() wrapper needed.
-        self._tied_embed: Optional[VocabParallelEmbedding] = None
+        # Must be nnx.data(None) — not bare None — so Flax marks this slot as
+        # a *data* attribute.  Assigning nnx.data(embed) later is only allowed
+        # when the initial value is also wrapped in nnx.data().
+        self._tied_embed = nnx.data(None)
 
     def tie_weights(self, embed: VocabParallelEmbedding) -> None:
         assert embed.num_embeddings == self.num_embeddings
         assert embed.embedding_dim == self.embedding_dim
-        # Store the embedding module directly as an NNX submodule reference.
-        # NNX Pytree machinery traverses nested Module attributes automatically,
-        # so this is the correct pattern — no nnx.data() wrapper required.
-        self._tied_embed = embed
+        # Keep slot type consistent: must wrap with nnx.data() to match the
+        # nnx.data(None) established in __init__.
+        self._tied_embed = nnx.data(embed)
 
     def load_weight(self, weight: jax.Array) -> None:
         start = self.tp_rank * self.num_embeddings_per_partition
@@ -111,12 +107,20 @@ class ParallelLMHead(nnx.Module):
     def effective_weight(self) -> jax.Array:
         """Return the weight matrix as a plain jax.Array.
 
-        When tie_word_embeddings=True, reads directly from the tied
-        VocabParallelEmbedding's weight_array.  Otherwise uses the LM
-        head's own weight parameter.
+        Uses the tied embedding's weight when tie_word_embeddings=True.
+        Unwraps nnx.data via get_raw_value() — the canonical non-deprecated
+        API (replaces the broken .value accessor that silently returned None).
         """
-        if self._tied_embed is not None:
-            return self._tied_embed.weight_array
+        tied_wrapper = self._tied_embed
+        # get_raw_value() is the non-deprecated replacement for .raw_value
+        # and .value, as shown in the DeprecationWarning emitted at runtime.
+        if hasattr(tied_wrapper, 'get_raw_value'):
+            embed = tied_wrapper.get_raw_value()
+        else:
+            # Fallback for older Flax versions that use .raw_value
+            embed = getattr(tied_wrapper, 'raw_value', None)
+        if embed is not None:
+            return embed.weight_array
         return _param_array(self.weight)
 
     def __call__(
