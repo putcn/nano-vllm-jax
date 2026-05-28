@@ -1,6 +1,6 @@
 """Llama model (JAX port of nanovllm/models/llama.py).
 
-Status: ✅ Done (Phase 4)
+Status: ✅ Fixed (last_indices forwarded correctly through LlamaForCausalLM)
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -289,6 +289,10 @@ class LlamaForCausalLM(nnx.Module):
             num_real_tokens=num_real_tokens,
             num_real_seqs=num_real_seqs,
         )
+        # last_indices: during prefill, select only the last real token per
+        # sequence so lm_head returns shape [num_seqs, vocab] rather than
+        # [T_pad, vocab].  During decode, last_indices=None is correct because
+        # each row in hidden already corresponds to one sequence's single token.
         return self.lm_head(hidden, last_indices=last_indices)
 
     def sample(
