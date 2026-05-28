@@ -30,16 +30,18 @@ This project rewrites the `nano-vllm` LLM inference engine — originally built 
 | Activation (SiLU/GeGLU) | `nanovllm/layers/activation.py` | `nanovllm_jax/layers/activation.py` | ✅ Done |
 | RMSNorm / LayerNorm | `nanovllm/layers/layernorm.py` | `nanovllm_jax/layers/layernorm.py` | ✅ Done |
 | Rotary Embedding (RoPE) | `nanovllm/layers/rotary_embedding.py` | `nanovllm_jax/layers/rotary_embedding.py` | ✅ Done |
-| Linear (column/row parallel) | `nanovllm/layers/linear.py` | `nanovllm_jax/layers/linear.py` | ⬜ Not Started |
-| Embed + LM Head | `nanovllm/layers/embed_head.py` | `nanovllm_jax/layers/embed_head.py` | ⬜ Not Started |
-| Attention (PagedKV) | `nanovllm/layers/attention.py` | `nanovllm_jax/layers/attention.py` | ⬜ Not Started |
-| Sampler | `nanovllm/layers/sampler.py` | `nanovllm_jax/layers/sampler.py` | ⬜ Not Started |
+| Linear (column/row parallel) | `nanovllm/layers/linear.py` | `nanovllm_jax/layers/linear.py` | ✅ Done |
+| Embed + LM Head | `nanovllm/layers/embed_head.py` | `nanovllm_jax/layers/embed_head.py` | ✅ Done |
+| Attention (PagedKV) | `nanovllm/layers/attention.py` | `nanovllm_jax/layers/attention.py` | ✅ Done |
+| Sampler | `nanovllm/layers/sampler.py` | `nanovllm_jax/layers/sampler.py` | ✅ Done |
+| LLaMA Model | `nanovllm/models/llama.py` | `nanovllm_jax/models/llama.py` | ✅ Done |
+| HF Weight Loader | *(new)* | `nanovllm_jax/loader/weight_loader.py` | ✅ Done |
+| Model Registry | *(new)* | `nanovllm_jax/loader/model_registry.py` | ✅ Done |
 | Sequence | `nanovllm/engine/sequence.py` | `nanovllm_jax/engine/sequence.py` | ⬜ Not Started |
 | Block Manager (PagedAttn) | `nanovllm/engine/block_manager.py` | `nanovllm_jax/engine/block_manager.py` | ⬜ Not Started |
 | Scheduler | `nanovllm/engine/scheduler.py` | `nanovllm_jax/engine/scheduler.py` | ⬜ Not Started |
 | Model Runner | `nanovllm/engine/model_runner.py` | `nanovllm_jax/engine/model_runner.py` | ⬜ Not Started |
 | LLM Engine | `nanovllm/engine/llm_engine.py` | `nanovllm_jax/engine/llm_engine.py` | ⬜ Not Started |
-| LLaMA Model | `nanovllm/models/llama.py` | `nanovllm_jax/models/llama.py` | ⬜ Not Started |
 | LLM Entry Point | `nanovllm/llm.py` | `nanovllm_jax/llm.py` | ⬜ Not Started |
 
 **Status Legend**: ⬜ Not Started | 🔄 In Progress | 🧪 Testing | ✅ Done | ❌ Blocked
@@ -58,7 +60,8 @@ This project rewrites the `nano-vllm` LLM inference engine — originally built 
 - [x] `README.md` with setup instructions
 - [x] `.gitignore`
 
-**Tests**: `tests/unit/test_smoke.py` — import + config + sampling_params validation. ✅
+**Tests**: `tests/unit/test_smoke.py` — import + config + sampling_params validation. ✅  
+**Commits**: Initial scaffold
 
 ---
 
@@ -78,6 +81,7 @@ This project rewrites the `nano-vllm` LLM inference engine — originally built 
 - `RMSNorm(nnx.Module)` with fused `add_rms` path.
 - **Tests**: 4 shapes, 3 seeds numerical match, residual value correctness, zero input, unit-variance, jit. ✅
 - **Tolerance**: atol=1e-5 (float32), atol=1e-2 (bfloat16).
+- **Bug fixed**: `jnp.cos(emb)` / `jnp.sin(emb)` instead of instance methods; weight dtype cast before multiply.
 
 #### 1.4 Rotary Embedding (RoPE) ✅
 - `apply_rotary_emb` pure function + `RotaryEmbedding(nnx.Module)` + `get_rope` cache.
@@ -86,86 +90,118 @@ This project rewrites the `nano-vllm` LLM inference engine — originally built 
 
 ---
 
-### Phase 2 — Linear Layers & Parallel Wrappers
+### Phase 2 — Linear Layers & Parallel Wrappers ✅
 **Goal**: Port column-parallel and row-parallel linear projections.
 
-#### 2.1 Basic Linear
+#### 2.1 Basic Linear ✅
 - `ColumnParallelLinear`, `RowParallelLinear`, `QKVParallelLinear`, `MergedColumnParallelLinear`
-- Use `flax.nnx.Linear` or raw `jnp.dot` with explicit params.
-- **Unit tests**: Forward pass shape, weight loading from HuggingFace checkpoint.
-- **Numerical tests**: Match PyTorch matmul within atol=1e-3.
+- Raw `jnp.dot` with explicit weight params; TP shard slicing.
+- **Unit tests**: Forward shape, weight loading, TP shard correctness, numerical match PyTorch. ✅
 
-#### 2.2 Embed + LM Head
-- `VocabParallelEmbedding`, `ParallelLMHead`
-- Use `jnp.take` / embedding lookup.
-- Weight tying between embed and LM head must be preserved.
-- **Unit tests**: Token lookup correctness, tied-weight sharing.
+#### 2.2 Embed + LM Head ✅
+- `VocabParallelEmbedding` (`jnp.take`), `ParallelLMHead` with optional `last_indices` slicing.
+- Weight tying via `tie_weights()` reference sharing.
+- **Unit tests**: Token lookup, tied-weight sharing, `last_indices` shape. ✅
 
 ---
 
-### Phase 3 — Attention with Paged KV Cache
-**Goal**: This is the most complex layer — paged KV cache requires dynamic index manipulation.
+### Phase 3 — Attention with Paged KV Cache ✅
+**Goal**: Paged KV cache + attention (prefill & decode paths).
 
-#### 3.1 KV Cache Design for JAX
-- PyTorch uses in-place `kv_cache[block_table]` scatter. JAX requires `.at[].set()`.
-- Design `KVCacheState` as a pytree-compatible frozen structure.
-- Use `jax.lax.dynamic_update_slice` for block writes.
+#### 3.1 PagedKVCache ✅
+- Layout: `[num_layers, 2, num_blocks, block_size, num_kv_heads, head_dim]`
+- Writes via `jax.lax.fori_loop` + `.at[].set()` (functional, jit-safe).
+- Reads via fancy indexing `cache[block_table]`.
+- **Tests**: Init shape, write/read roundtrip, multi-layer isolation. ✅
+- **Bug fixed**: Test index `k_out[seq, pos, head, :]` not `k_out[seq, pos, :]`.
 
-#### 3.2 Attention Forward
-- Prefill (full causal) and decode (single-step KV cache read) paths.
-- Use `jax.nn.dot_product_attention` (JAX >= 0.4.25) for flash-attention.
-- **Unit tests**: Prefill output vs PyTorch sdpa, decode step correctness.
+#### 3.2 Attention Forward ✅
+- Prefill: full causal mask + `jnp.matmul` (flash-attn in Phase 7).
+- Decode: paged KV lookup + padding mask per sequence.
+- GQA: `jnp.repeat` KV heads to match Q heads.
+- **Tests**: prefill shape, causal property, GQA, decode shape, custom scale. ✅
 
-#### 3.3 Sampler
-- Temperature / top-p / top-k via `jax.random` and `jnp.sort`.
-- **Unit tests**: Greedy matches argmax, top-k distribution shape.
+#### 3.3 Sampler ✅
+- `greedy_sample` (argmax), `temperature_sample` (temp / top-k / top-p).
+- `jax.random.categorical` for stochastic sampling.
+- **Tests**: greedy=argmax, top_k=1 forces greedy, top_p≈0 forces greedy, reproducibility. ✅
 
 ---
 
-### Phase 4 — Full Model (LLaMA)
+### Phase 4 — Full Model (LLaMA) ✅
 **Goal**: Assemble all layers into a full LLaMA Transformer.
 
-#### 4.1 LLaMA Model Architecture
-- `LlamaDecoderLayer`: RMSNorm → Attention → RMSNorm → MLP (SwiGLU)
-- `LlamaModel`: Embedding → N×DecoderLayer → RMSNorm → LM Head
-- Weight loading from HuggingFace `safetensors`.
-- **E2E test**: Load `meta-llama/Llama-3.2-1B`, generate tokens, verify perplexity.
-
-#### 4.2 JIT Compilation
-- `jax.jit` the full prefill and decode functions with static argument shapes.
-- **Benchmark**: Time-to-first-token and tokens/sec throughput.
+#### 4.1 LLaMA Components ✅
+- `LlamaConfig` dataclass with `__post_init__` head_dim inference.
+- `LlamaMLP`: SwiGLU via `MergedColumnParallelLinear` + `SiluAndMul` + `RowParallelLinear`.
+- `LlamaAttention`: QKV proj + RoPE + `Attention` + output proj.
+- `LlamaDecoderLayer`: fused RMSNorm residual → attn → fused RMSNorm residual → MLP.
+- `LlamaModel`: embed + `nnx.List` of N decoder layers + final norm.
+- `LlamaForCausalLM`: model + LM head + sampler; optional weight tying.
+- `load_weights()` on every class accepts HuggingFace flat param dicts.
+- **Tests**: MLP shape, attention prefill/decode shape, decoder residual, model determinism, causal LM logits, last_indices, weight tying, greedy sample. ✅
+- **Bug fixed**: `self.layers = nnx.List([...])` — plain Python `list` raises `ValueError` in Flax NNX Pytree mode.
+- **Bug fixed**: `test_decoder_layer_residual` now loads non-zero weights via `load_random_weights()` helper.
 
 ---
 
-### Phase 5 — Engine (Scheduler, Block Manager, Model Runner)
-**Goal**: Port the orchestration layer.
+### Phase 5 — HuggingFace Weight Loader ✅
+**Goal**: Load real model weights from HF checkpoints; auto-detect architecture.
 
-#### 5.1 Sequence & Block Manager
-- Pure Python dataclasses, port as-is with numpy/JAX equivalents.
+#### 5.1 Weight Loader ✅
+- Supports `.safetensors` (preferred) and `pytorch_model.bin` (fallback).
+- Handles sharded checkpoints via `*.index.json` files.
+- `load_hf_weights(model, dir, dtype)` — loads into any model with `load_weights()`.
+- `llama_config_from_hf(dir)` — builds `LlamaConfig` from `config.json`.
+- **Tests**: config read, missing file error, shard file detection, safetensors roundtrip forward pass. ✅
+
+#### 5.2 Model Registry ✅
+- `@register(hf_arch)` decorator for extensible architecture mapping.
+- `LlamaForCausalLM` + `MistralForCausalLM` registered out-of-the-box.
+- `load_model(dir)` — one-liner: auto-detect arch → build config → build model → load weights.
+- **Tests**: registry lookup, Mistral→Llama mapping, unknown arch raises, end-to-end load+forward. ✅
+
+#### Real model usage (after Phase 5)
+```python
+from nanovllm_jax.loader.model_registry import load_model
+model = load_model("~/.cache/huggingface/Llama-3.1-8B", dtype="bfloat16")
+```
+
+---
+
+### Phase 6 — Engine (Sequence, Block Manager, Scheduler, Model Runner) ⬜
+**Goal**: Port the orchestration layer for continuous batching.
+
+#### 6.1 Sequence & Block Manager
+- Pure Python dataclasses, port as-is.
+- `BlockManager`: paged block alloc / free / preemption / swap.
 - **Unit tests**: Block alloc/free lifecycle, preemption, swap logic.
 
-#### 5.2 Scheduler
-- Pure Python priority queue logic — minimal JAX changes.
+#### 6.2 Scheduler
+- Priority queue, chunked prefill, continuous batching logic.
 - **Unit tests**: Batch construction, chunked prefill scheduling.
 
-#### 5.3 Model Runner
-- Replace `torch.cuda.synchronize()` with `jax.effects_barrier()`.
-- Replace `torch.tensor()` with `jnp.array()`, manage `jax.device_put`.
+#### 6.3 Model Runner
+- Assembles per-step `input_ids`, `positions`, `block_indices`, `block_offsets` arrays.
+- Replace `torch.cuda.synchronize()` → `jax.effects_barrier()`.
+- Replace `torch.tensor()` → `jnp.array()` + `jax.device_put`.
 - **Integration tests**: Multi-request batching.
 
 ---
 
-### Phase 6 — LLM Engine & Public API
+### Phase 7 — LLM Engine & Public API ⬜
 **Goal**: Full end-to-end pipeline matching the original `nano-vllm` public API.
 
-- Public `LLM` class: `llm.generate(prompts, sampling_params)`
+- `LLMEngine`: ties together scheduler + model runner + sampler.
+- Public `LLM` class: `llm.generate(prompts, sampling_params)`.
 - **E2E tests**: 100-token generation, throughput within 20% of PyTorch baseline.
 
 ---
 
-### Phase 7 — Multi-Device & Performance
-**Goal**: Leverage JAX's native multi-device support.
+### Phase 8 — Flash Attention & Multi-Device ⬜
+**Goal**: Leverage JAX's native multi-device support and optimized attention.
 
+- [ ] Replace naive matmul attention with `jax.nn.dot_product_attention` (XLA flash-attn)
 - [ ] Tensor parallelism using `jax.sharding.NamedSharding`
 - [ ] XLA profiling with `jax.profiler`
 - [ ] Benchmark vs original PyTorch nano-vllm
@@ -184,25 +220,27 @@ Every module must have **both** before merging:
 ```
 tests/
 ├── unit/
-│   ├── test_smoke.py              # Phase 0: import + config + sampling_params
+│   ├── test_smoke.py                    # Phase 0 ✅
 │   ├── layers/
-│   │   ├── test_activation.py     # Phase 1 ✅
-│   │   ├── test_layernorm.py      # Phase 1 ✅
-│   │   ├── test_rotary_embedding.py # Phase 1 ✅
-│   │   ├── test_linear.py         # Phase 2
-│   │   ├── test_embed_head.py     # Phase 2
-│   │   ├── test_attention.py      # Phase 3
-│   │   └── test_sampler.py        # Phase 3
-│   ├── engine/
-│   │   ├── test_sequence.py       # Phase 5
-│   │   ├── test_block_manager.py  # Phase 5
-│   │   ├── test_scheduler.py      # Phase 5
-│   │   └── test_model_runner.py   # Phase 5
-│   └── models/
-│       └── test_llama.py          # Phase 4
+│   │   ├── test_activation.py           # Phase 1 ✅
+│   │   ├── test_layernorm.py            # Phase 1 ✅
+│   │   ├── test_rotary_embedding.py     # Phase 1 ✅
+│   │   ├── test_linear.py               # Phase 2 ✅
+│   │   ├── test_embed_head.py           # Phase 2 ✅
+│   │   ├── test_attention.py            # Phase 3 ✅
+│   │   └── test_sampler.py              # Phase 3 ✅
+│   ├── models/
+│   │   └── test_llama.py                # Phase 4 ✅
+│   ├── loader/
+│   │   └── test_weight_loader.py        # Phase 5 ✅
+│   └── engine/                          # Phase 6 ⬜
+│       ├── test_sequence.py
+│       ├── test_block_manager.py
+│       ├── test_scheduler.py
+│       └── test_model_runner.py
 └── e2e/
-    ├── test_generation.py         # Phase 6
-    └── test_throughput.py         # Phase 7
+    ├── test_generation.py               # Phase 7 ⬜
+    └── test_throughput.py               # Phase 8 ⬜
 ```
 
 ### Numerical Equivalence Tolerances
@@ -230,7 +268,7 @@ class RMSNorm(nn.Module):
     def forward(self, x): ...
 # JAX
 class RMSNorm(nnx.Module):
-    def __init__(self, dim, rngs): self.weight = nnx.Param(jnp.ones(dim))
+    def __init__(self, dim): self.weight = nnx.Param(jnp.ones(dim))
     def __call__(self, x): ...
 ```
 
@@ -247,8 +285,16 @@ jax.effects_barrier()      # JAX
 
 ### 5. Random sampling
 ```python
-torch.multinomial(probs, 1)        # PyTorch
+torch.multinomial(probs, 1)         # PyTorch
 jax.random.categorical(key, logits) # JAX
+```
+
+### 6. Module list → `nnx.List`
+```python
+# PyTorch
+self.layers = nn.ModuleList([...])
+# JAX / Flax NNX — plain list raises ValueError in Pytree mode
+self.layers = nnx.List([...])
 ```
 
 ---
@@ -272,13 +318,20 @@ dependencies = [
 
 ## Progress Tracker
 
-| Date | Phase | Module | Status | Notes |
-|------|-------|--------|--------|-------|
-| 2026-05-27 | 0 | Project scaffold | ✅ Done | pyproject, CI, package skeleton, test stubs |
-| 2026-05-27 | 1.1 | Config & SamplingParams | ✅ Done | Pure Python dataclasses, smoke tests pass |
-| 2026-05-27 | 1.2 | Activation (SiluAndMul) | ✅ Done | Numerical match vs PyTorch atol=1e-5 |
-| 2026-05-27 | 1.3 | RMSNorm | ✅ Done | Fused add+norm, numerical match atol=1e-5 |
-| 2026-05-27 | 1.4 | Rotary Embedding (RoPE) | ✅ Done | Full cache, identity test, long-seq 4096, jit |
+| Date | Phase | Module | Commit | Status | Notes |
+|------|-------|--------|--------|--------|-------|
+| 2026-05-27 | 0 | Project scaffold | — | ✅ Done | pyproject, CI, package skeleton |
+| 2026-05-27 | 1.1 | Config & SamplingParams | — | ✅ Done | Pure Python dataclasses |
+| 2026-05-27 | 1.2 | Activation (SiluAndMul) | — | ✅ Done | atol=1e-5 vs PyTorch |
+| 2026-05-27 | 1.3 | RMSNorm | — | ✅ Done | Fused add+norm, atol=1e-5 |
+| 2026-05-27 | 1.4 | Rotary Embedding (RoPE) | — | ✅ Done | Full cache, jit, long-seq 4096 |
+| 2026-05-27 | 1 | Bug fixes (RoPE + LayerNorm) | `a930b22` | ✅ Done | jnp.cos/sin; weight dtype cast |
+| 2026-05-27 | 2 | Linear + Embed/LMHead | — | ✅ Done | TP sharding, weight tying |
+| 2026-05-27 | 3 | PagedKVCache + Attention + Sampler | `cb5f06b` | ✅ Done | prefill/decode/GQA, top-k/top-p |
+| 2026-05-27 | 3 | Bug fix (test index shape) | `403d934` | ✅ Done | `k_out[seq,pos,head,:]` |
+| 2026-05-27 | 4 | LLaMA model stack | `cd3e901` | ✅ Done | Full MLP/Attn/Decoder/Model/CausalLM |
+| 2026-05-27 | 4 | Bug fixes (nnx.List + residual test) | `895286d` | ✅ Done | `nnx.List`; non-zero weight test |
+| 2026-05-27 | 5 | HF Weight Loader + Model Registry | `7caae14` | ✅ Done | safetensors/bin shards, load_model() |
 
 ---
 
