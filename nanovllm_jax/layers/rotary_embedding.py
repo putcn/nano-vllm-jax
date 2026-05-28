@@ -1,12 +1,8 @@
-"""Rotary Position Embedding (JAX port of nanovllm/layers/rotary_embedding.py).
+"""Rotary positional embedding (JAX port of nanovllm/layers/rotary_embedding.py).
 
 Status: ✅ Done (Phase 1.4)
-
-Original: pre-computes cos/sin cache as a buffer, applies per position.
-JAX: cos_sin_cache stored as plain jnp array (not a param - not learned).
-apply_rotary_emb is a pure function, jit-compilable.
-get_rope is cached via functools.lru_cache.
 """
+from __future__ import annotations
 from functools import lru_cache
 import jax
 import jax.numpy as jnp
@@ -14,80 +10,96 @@ from flax import nnx
 
 
 def apply_rotary_emb(
-    x: jax.Array,
+    q: jax.Array,
+    k: jax.Array,
     cos: jax.Array,
     sin: jax.Array,
-) -> jax.Array:
-    """Apply rotary embeddings to query or key tensor.
+) -> tuple[jax.Array, jax.Array]:
+    """Apply rotary embeddings to query and key tensors.
 
     Args:
-        x:   (..., head_size) in any dtype
-        cos: (..., head_size//2) slice of cos cache
-        sin: (..., head_size//2) slice of sin cache
+        q:   (seq_len, num_heads, head_dim)
+        k:   (seq_len, num_kv_heads, head_dim)
+        cos: (seq_len, head_dim)
+        sin: (seq_len, head_dim)
     Returns:
-        rotated x, same shape and dtype as input.
+        (q_rot, k_rot) with same shapes as inputs
     """
-    orig_dtype = x.dtype
-    x_f32 = x.astype(jnp.float32)
-    half = x_f32.shape[-1] // 2
-    x1, x2 = x_f32[..., :half], x_f32[..., half:]
-    y1 = x1 * cos - x2 * sin
-    y2 = x2 * cos + x1 * sin
-    return jnp.concatenate([y1, y2], axis=-1).astype(orig_dtype)
+    def rotate_half(x: jax.Array) -> jax.Array:
+        half = x.shape[-1] // 2
+        x1, x2 = x[..., :half], x[..., half:]
+        return jnp.concatenate([-x2, x1], axis=-1)
 
-
-class RotaryEmbedding(nnx.Module):
-    """Precomputed RoPE cache with positional lookup.
-
-    Args:
-        head_size: size of each attention head.
-        rotary_dim: must equal head_size (full RoPE).
-        max_position_embeddings: maximum sequence length.
-        base: frequency base (default 10000).
-    """
-
-    def __init__(
-        self,
-        head_size: int,
-        rotary_dim: int,
-        max_position_embeddings: int,
-        base: float,
-    ) -> None:
-        assert rotary_dim == head_size, "Only full RoPE (rotary_dim == head_size) supported."
-        self.head_size = head_size
-
-        inv_freq = 1.0 / (
-            base ** (jnp.arange(0, rotary_dim, 2, dtype=jnp.float32) / rotary_dim)
-        )
-        t = jnp.arange(max_position_embeddings, dtype=jnp.float32)
-        freqs = jnp.einsum("i,j->ij", t, inv_freq)  # (max_pos, rotary_dim//2)
-        cos = jnp.cos(freqs)
-        sin = jnp.sin(freqs)
-        # shape: (max_pos, 1, rotary_dim)  [1 = num_heads broadcast dim]
-        self.cos_sin_cache = jnp.concatenate([cos, sin], axis=-1)[:, None, :]
-
-    def __call__(
-        self,
-        positions: jax.Array,   # (seq_len,) int32
-        query: jax.Array,       # (seq_len, num_heads, head_size)
-        key: jax.Array,         # (seq_len, num_kv_heads, head_size)
-    ) -> tuple[jax.Array, jax.Array]:
-        """Apply RoPE to query and key."""
-        cos_sin = self.cos_sin_cache[positions]          # (seq_len, 1, rotary_dim)
-        half = cos_sin.shape[-1] // 2
-        cos = cos_sin[..., :half]
-        sin = cos_sin[..., half:]
-        query_rot = apply_rotary_emb(query, cos, sin)
-        key_rot = apply_rotary_emb(key, cos, sin)
-        return query_rot, key_rot
+    cos_ = cos[:, None, :]  # (seq, 1, head_dim)
+    sin_ = sin[:, None, :]
+    q_rot = q * cos_ + rotate_half(q) * sin_
+    k_rot = k * cos_ + rotate_half(k) * sin_
+    return q_rot, k_rot
 
 
 @lru_cache(maxsize=8)
 def get_rope(
-    head_size: int,
-    rotary_dim: int,
-    max_position: int,
-    base: float,
-) -> RotaryEmbedding:
-    """Cached factory for RotaryEmbedding instances."""
-    return RotaryEmbedding(head_size, rotary_dim, max_position, base)
+    head_dim: int,
+    max_seq_len: int,
+    base: float = 10000.0,
+    dtype: jnp.dtype = jnp.float32,
+) -> tuple[jax.Array, jax.Array]:
+    """Build and cache (cos, sin) tables for RoPE.
+
+    Args:
+        head_dim:    per-head feature dimension (must be even)
+        max_seq_len: maximum sequence length to pre-compute
+        base:        RoPE base frequency
+        dtype:       output dtype
+    Returns:
+        (cos, sin) each of shape (max_seq_len, head_dim)
+    """
+    assert head_dim % 2 == 0
+    theta = 1.0 / (base ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
+    positions = jnp.arange(max_seq_len, dtype=jnp.float32)
+    freqs = jnp.outer(positions, theta)          # (seq, head_dim/2)
+    emb = jnp.concatenate([freqs, freqs], axis=-1)  # (seq, head_dim)
+    return emb.cos().astype(dtype), emb.sin().astype(dtype)
+
+
+class RotaryEmbedding(nnx.Module):
+    """Stateful NNX wrapper that caches and applies RoPE.
+
+    Args:
+        head_dim:    per-head dimension
+        max_seq_len: maximum sequence length
+        base:        RoPE base frequency
+    """
+
+    def __init__(
+        self,
+        head_dim: int,
+        max_seq_len: int = 4096,
+        base: float = 10000.0,
+    ) -> None:
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+        cos, sin = get_rope(head_dim, max_seq_len, base)
+        # Store as non-trainable buffers
+        self.cos_cached = nnx.Variable(cos)
+        self.sin_cached = nnx.Variable(sin)
+
+    def __call__(
+        self,
+        q: jax.Array,
+        k: jax.Array,
+        positions: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Apply RoPE to q and k at the given positions.
+
+        Args:
+            q:         (seq_len, num_heads, head_dim)
+            k:         (seq_len, num_kv_heads, head_dim)
+            positions: (seq_len,) int32 position indices
+        Returns:
+            (q_rot, k_rot)
+        """
+        cos = self.cos_cached.get_value()[positions]
+        sin = self.sin_cached.get_value()[positions]
+        return apply_rotary_emb(q, k, cos, sin)

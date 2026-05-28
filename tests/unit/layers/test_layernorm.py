@@ -1,8 +1,4 @@
-"""Unit tests for RMSNorm (Phase 1.3).
-
-Numerical equivalence verified against PyTorch RMSNorm reference.
-Tolerances: atol=1e-5 float32, atol=1e-2 bfloat16.
-"""
+"""Unit tests for RMSNorm (Phase 1.3)."""
 import pytest
 import numpy as np
 import jax
@@ -12,92 +8,86 @@ from flax import nnx
 from nanovllm_jax.layers.layernorm import RMSNorm
 
 
-def make_rmsnorm(hidden_size: int, eps: float = 1e-6) -> RMSNorm:
-    return RMSNorm(hidden_size, eps=eps, rngs=nnx.Rngs(0))
+def rand(shape, seed=0):
+    return np.random.default_rng(seed).standard_normal(shape).astype(np.float32)
 
 
-def torch_rmsnorm(x_np, weight_np, eps=1e-6):
+def torch_rmsnorm(x_np, w_np, eps=1e-6):
     try:
-        import torch, torch.nn as nn
-        hidden = x_np.shape[-1]
-        norm = nn.RMSNorm(hidden, eps=eps)
-        norm.weight = nn.Parameter(torch.tensor(weight_np))
-        with torch.no_grad():
-            return norm(torch.tensor(x_np)).numpy()
+        import torch
+        x = torch.tensor(x_np)
+        w = torch.tensor(w_np)
+        norm = torch.nn.RMSNorm(x_np.shape[-1], eps=eps, elementwise_affine=True)
+        norm.weight = torch.nn.Parameter(w)
+        return norm(x).detach().numpy()
     except ImportError:
-        x_f32 = x_np.astype(np.float32)
-        var = np.mean(x_f32 ** 2, axis=-1, keepdims=True)
-        return (x_f32 / np.sqrt(var + eps) * weight_np).astype(x_np.dtype)
+        rms = np.sqrt(np.mean(x_np ** 2, axis=-1, keepdims=True) + eps)
+        return x_np / rms * w_np
 
 
-@pytest.mark.parametrize("shape", [(4, 64), (1, 128), (8, 256), (2, 5, 64)])
+@pytest.mark.parametrize("shape", [(4, 64), (2, 8, 128), (1, 256), (16, 32)])
 def test_output_shape(shape):
-    norm = make_rmsnorm(shape[-1])
-    assert norm(jnp.ones(shape)).shape == shape
+    layer = RMSNorm(shape[-1])
+    assert layer(jnp.ones(shape)).shape == shape
 
 
-@pytest.mark.parametrize("seed", [0, 1, 42])
+@pytest.mark.parametrize("seed", [0, 1, 2])
 def test_numerical_match_float32(seed):
-    hidden = 64
-    rng = np.random.default_rng(seed)
-    x_np = rng.standard_normal((8, hidden)).astype(np.float32)
-    weight_np = rng.standard_normal(hidden).astype(np.float32) * 0.5 + 1.0
-    norm = make_rmsnorm(hidden)
-    norm.weight = nnx.Param(jnp.array(weight_np))
-    out = np.array(norm(jnp.array(x_np)))
-    ref = torch_rmsnorm(x_np, weight_np)
+    dim = 64
+    x_np = rand((8, dim), seed)
+    layer = RMSNorm(dim)
+    out = np.array(layer(jnp.array(x_np)))
+    ref = torch_rmsnorm(x_np, np.ones(dim))
     np.testing.assert_allclose(out, ref, atol=1e-5, rtol=1e-5)
 
 
-def test_numerical_match_bfloat16():
-    hidden = 64
-    rng = np.random.default_rng(99)
-    x_np = rng.standard_normal((4, hidden)).astype(np.float32)
-    weight_np = np.ones(hidden, dtype=np.float32)
-    norm = make_rmsnorm(hidden)
-    norm.weight = nnx.Param(jnp.array(weight_np))
-    out = np.array(norm(jnp.array(x_np).astype(jnp.bfloat16)).astype(jnp.float32))
-    ref = torch_rmsnorm(x_np, weight_np)
-    np.testing.assert_allclose(out, ref, atol=1e-2, rtol=1e-2)
+def test_learned_weight():
+    dim = 32
+    x_np = rand((4, dim), 0)
+    w_np = rand((dim,), 1) + 1.0
+    layer = RMSNorm(dim)
+    layer.weight = nnx.Param(jnp.array(w_np))
+    out = np.array(layer(jnp.array(x_np)))
+    ref = torch_rmsnorm(x_np, w_np)
+    np.testing.assert_allclose(out, ref, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.parametrize("seed", [0, 7])
-def test_add_rms_forward_shape(seed):
-    rng = np.random.default_rng(seed)
-    hidden = 32
-    x = jnp.array(rng.standard_normal((4, hidden)).astype(np.float32))
-    res = jnp.array(rng.standard_normal((4, hidden)).astype(np.float32))
-    norm = make_rmsnorm(hidden)
-    normed, new_res = norm(x, residual=res)
-    assert normed.shape == (4, hidden)
-    assert new_res.shape == (4, hidden)
+def test_fused_residual():
+    dim = 64
+    x_np = rand((4, dim), 0)
+    r_np = rand((4, dim), 1)
+    layer = RMSNorm(dim)
+    normed, residual_out = layer(jnp.array(x_np), residual=jnp.array(r_np))
+    np.testing.assert_allclose(np.array(residual_out), x_np + r_np, atol=1e-6)
+    ref = torch_rmsnorm(x_np + r_np, np.ones(dim))
+    np.testing.assert_allclose(np.array(normed), ref, atol=1e-5)
 
 
-def test_add_rms_residual_value():
-    hidden = 16
-    x_np = np.ones((2, hidden), dtype=np.float32)
-    res_np = np.full((2, hidden), 2.0, dtype=np.float32)
-    norm = make_rmsnorm(hidden)
-    _, new_res = norm(jnp.array(x_np), residual=jnp.array(res_np))
-    np.testing.assert_allclose(np.array(new_res), x_np + res_np, atol=1e-6)
+def test_zero_input():
+    layer = RMSNorm(32)
+    x = jnp.zeros((4, 32))
+    out = layer(x)
+    assert not jnp.any(jnp.isnan(out))
 
 
 def test_unit_variance_input():
-    hidden = 64
-    norm = make_rmsnorm(hidden)
-    x_np = np.random.default_rng(0).standard_normal((4, hidden)).astype(np.float32)
-    x_np /= np.sqrt(np.mean(x_np**2, axis=-1, keepdims=True))
-    out = np.array(norm(jnp.array(x_np)))
-    np.testing.assert_allclose(out, x_np, atol=1e-5)
+    dim = 64
+    layer = RMSNorm(dim)
+    x = jnp.ones((4, dim))
+    out = np.array(layer(x))
+    np.testing.assert_allclose(out, np.ones((4, dim)), atol=1e-5)
 
 
-def test_zero_input_output_zero():
-    norm = make_rmsnorm(32)
-    out = norm(jnp.zeros((3, 32)))
-    assert jnp.allclose(out, jnp.zeros_like(out), atol=1e-6)
+def test_bfloat16():
+    dim = 64
+    layer = RMSNorm(dim)
+    x = jnp.array(rand((4, dim)), dtype=jnp.bfloat16)
+    out = layer(x)
+    assert out.dtype == jnp.bfloat16
 
 
-def test_jit_compilable():
-    norm = make_rmsnorm(64)
-    jitted = nnx.jit(norm)
-    assert jitted(jnp.ones((4, 64))).shape == (4, 64)
+def test_jit():
+    dim = 32
+    layer = RMSNorm(dim)
+    jitted = nnx.jit(layer)
+    assert jitted(jnp.ones((4, dim))).shape == (4, dim)

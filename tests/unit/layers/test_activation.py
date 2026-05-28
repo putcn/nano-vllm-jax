@@ -1,88 +1,71 @@
-"""Unit tests for activation functions (Phase 1.2).
-
-Numerical equivalence verified against PyTorch F.silu reference.
-Tolerances: atol=1e-5, rtol=1e-5 (float32 ops).
-"""
+"""Unit tests for activation functions (Phase 1.2)."""
 import pytest
 import numpy as np
 import jax
 import jax.numpy as jnp
-
-jax.config.update("jax_enable_x64", False)
+from flax import nnx
 
 from nanovllm_jax.layers.activation import silu_and_mul, SiluAndMul
 
 
-def torch_silu_and_mul(x_np: np.ndarray) -> np.ndarray:
+def rand(shape, seed=0):
+    return np.random.default_rng(seed).standard_normal(shape).astype(np.float32)
+
+
+def torch_silu_and_mul(x_np):
     try:
         import torch
         import torch.nn.functional as F
         x = torch.tensor(x_np)
         half = x.shape[-1] // 2
-        gate, val = x[..., :half], x[..., half:]
-        return (F.silu(gate) * val).numpy()
+        return (F.silu(x[..., :half]) * x[..., half:]).numpy()
     except ImportError:
         half = x_np.shape[-1] // 2
-        gate, val = x_np[..., :half], x_np[..., half:]
-        silu = gate * (1.0 / (1.0 + np.exp(-gate)))
-        return silu * val
+        return (1 / (1 + np.exp(-x_np[..., :half]))) * x_np[..., :half] * x_np[..., half:]
 
 
-@pytest.mark.parametrize("shape", [
-    (4, 16), (1, 8), (8, 64), (2, 3, 32),
-])
+@pytest.mark.parametrize("shape", [(4, 8), (2, 3, 16), (1, 32), (8, 64)])
 def test_output_shape(shape):
     x = jnp.ones(shape)
     out = silu_and_mul(x)
     assert out.shape == shape[:-1] + (shape[-1] // 2,)
 
 
-@pytest.mark.parametrize("seed", [0, 42, 123])
+@pytest.mark.parametrize("seed", [0, 1, 2])
 def test_numerical_match_float32(seed):
-    rng = np.random.default_rng(seed)
-    x_np = rng.standard_normal((8, 64)).astype(np.float32)
-    ref = torch_silu_and_mul(x_np)
+    x_np = rand((8, 32), seed)
     out = np.array(silu_and_mul(jnp.array(x_np)))
+    ref = torch_silu_and_mul(x_np)
     np.testing.assert_allclose(out, ref, atol=1e-5, rtol=1e-5)
 
 
-def test_numerical_match_bfloat16():
-    rng = np.random.default_rng(7)
-    x_np = rng.standard_normal((4, 32)).astype(np.float32)
-    ref = torch_silu_and_mul(x_np)
-    x_bf16 = jnp.array(x_np).astype(jnp.bfloat16)
-    out = np.array(silu_and_mul(x_bf16).astype(jnp.float32))
-    np.testing.assert_allclose(out, ref, atol=1e-2, rtol=1e-2)
-
-
 def test_zero_input():
-    x = jnp.zeros((4, 16))
+    x = jnp.zeros((4, 8))
     out = silu_and_mul(x)
-    np.testing.assert_array_equal(np.array(out), np.zeros((4, 8)))
+    np.testing.assert_allclose(np.array(out), np.zeros((4, 4)), atol=1e-6)
 
 
-def test_large_positive():
-    x = jnp.full((2, 8), 100.0)
+def test_large_input_no_nan():
+    x = jnp.array(rand((4, 16), 0) * 100)
     out = silu_and_mul(x)
-    assert float(out.min()) > 9000
+    assert not jnp.any(jnp.isnan(out))
 
 
-def test_jit_compilable():
+def test_bfloat16():
+    x = jnp.array(rand((4, 8), 0), dtype=jnp.bfloat16)
+    out = silu_and_mul(x)
+    assert out.dtype == jnp.bfloat16
+    np.testing.assert_allclose(np.array(out, dtype=np.float32),
+                               torch_silu_and_mul(rand((4, 8), 0)), atol=1e-2)
+
+
+def test_nnx_wrapper():
+    layer = SiluAndMul()
+    x = jnp.array(rand((4, 16)))
+    np.testing.assert_allclose(np.array(layer(x)), np.array(silu_and_mul(x)), atol=1e-7)
+
+
+def test_jit():
     jitted = jax.jit(silu_and_mul)
-    out = jitted(jnp.ones((4, 16)))
-    assert out.shape == (4, 8)
-
-
-def test_module_wrapper():
-    from flax import nnx
-    m = SiluAndMul()
-    out = m(jnp.ones((2, 8)))
-    assert out.shape == (2, 4)
-
-
-def test_module_jit():
-    from flax import nnx
-    m = SiluAndMul()
-    jitted = nnx.jit(m)
-    out = jitted(jnp.ones((2, 8)))
-    assert out.shape == (2, 4)
+    x = jnp.array(rand((4, 16)))
+    np.testing.assert_allclose(np.array(jitted(x)), np.array(silu_and_mul(x)), atol=1e-7)

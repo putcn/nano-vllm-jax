@@ -1,12 +1,9 @@
 """Unit tests for linear layers (Phase 2.1).
 
-Numerical equivalence verified against PyTorch F.linear reference.
-
 Tolerance note:
-  JAX/XLA matmul uses different floating-point accumulation order vs PyTorch,
-  causing systematic differences up to ~0.01 in float32. We use atol=1e-2
-  which still catches wrong implementations while accepting XLA differences.
-  For bfloat16 the tolerance would need to be wider (~0.1).
+  JAX/XLA matmul uses different fp32 accumulation order vs PyTorch.
+  Max observed difference ~0.008. We use atol=1e-2 which catches wrong
+  implementations while accepting XLA accumulation differences.
 """
 import pytest
 import numpy as np
@@ -22,14 +19,9 @@ from nanovllm_jax.layers.linear import (
     RowParallelLinear,
 )
 
-# XLA vs PyTorch matmul accumulation difference in float32
 ATOL = 1e-2
 RTOL = 1e-2
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def rand(shape, seed=0):
     return np.random.default_rng(seed).standard_normal(shape).astype(np.float32)
@@ -66,11 +58,9 @@ def test_replicated_linear_numerical(seed):
     x_np = rand((8, in_f), seed)
     w_np = rand((out_f, in_f), seed + 10)
     b_np = rand((out_f,), seed + 20)
-
     layer = ReplicatedLinear(in_f, out_f, bias=True)
     layer.load_weight(jnp.array(w_np))
     layer.load_bias(jnp.array(b_np))
-
     out = np.array(layer(jnp.array(x_np)))
     ref = torch_linear(x_np, w_np, b_np)
     np.testing.assert_allclose(out, ref, atol=ATOL, rtol=RTOL)
@@ -107,8 +97,8 @@ def test_column_parallel_weight_sharding():
     layers = [ColumnParallelLinear(in_f, out_f, tp_size=2, tp_rank=r) for r in range(2)]
     for layer in layers:
         layer.load_weight(jnp.array(w_full))
-    np.testing.assert_allclose(np.array(layers[0].weight.value), w_full[:16, :], atol=1e-6)
-    np.testing.assert_allclose(np.array(layers[1].weight.value), w_full[16:, :], atol=1e-6)
+    np.testing.assert_allclose(np.array(layers[0].weight[...]), w_full[:16, :], atol=1e-6)
+    np.testing.assert_allclose(np.array(layers[1].weight[...]), w_full[16:, :], atol=1e-6)
 
 
 @pytest.mark.parametrize("seed", [0, 5])
@@ -116,7 +106,6 @@ def test_column_parallel_numerical(seed):
     in_f, out_f = 32, 64
     x_np = rand((8, in_f), seed)
     w_full = rand((out_f, in_f), seed + 1)
-
     layer = ColumnParallelLinear(in_f, out_f, tp_size=1, tp_rank=0)
     layer.load_weight(jnp.array(w_full))
     out = np.array(layer(jnp.array(x_np)))
@@ -140,12 +129,10 @@ def test_merged_column_correctness():
     w0 = rand((64, in_f), 0)
     w1 = rand((64, in_f), 1)
     x_np = rand((4, in_f), 2)
-
     merged = MergedColumnParallelLinear(in_f, [64, 64])
     merged.load_weight(jnp.array(w0), shard_id=0)
     merged.load_weight(jnp.array(w1), shard_id=1)
     out = np.array(merged(jnp.array(x_np)))
-
     ref = np.concatenate([torch_linear(x_np, w0), torch_linear(x_np, w1)], axis=-1)
     np.testing.assert_allclose(out, ref, atol=ATOL, rtol=RTOL)
 
@@ -160,8 +147,7 @@ def test_qkv_parallel_shape():
     layer.load_weight(jnp.array(rand((num_heads * head_size, hidden))), shard_id="q")
     layer.load_weight(jnp.array(rand((num_kv_heads * head_size, hidden))), shard_id="k")
     layer.load_weight(jnp.array(rand((num_kv_heads * head_size, hidden))), shard_id="v")
-    out = layer(jnp.ones((4, hidden)))
-    assert out.shape == (4, (num_heads + 2 * num_kv_heads) * head_size)
+    assert layer(jnp.ones((4, hidden))).shape == (4, (num_heads + 2 * num_kv_heads) * head_size)
 
 
 def test_qkv_parallel_gqa_shape():
@@ -170,8 +156,7 @@ def test_qkv_parallel_gqa_shape():
     layer.load_weight(jnp.array(rand((num_heads * head_size, hidden))), shard_id="q")
     layer.load_weight(jnp.array(rand((num_kv_heads * head_size, hidden))), shard_id="k")
     layer.load_weight(jnp.array(rand((num_kv_heads * head_size, hidden))), shard_id="v")
-    out = layer(jnp.ones((4, hidden)))
-    assert out.shape == (4, (num_heads + 2 * num_kv_heads) * head_size)
+    assert layer(jnp.ones((4, hidden))).shape == (4, (num_heads + 2 * num_kv_heads) * head_size)
 
 
 def test_qkv_invalid_shard_id():
@@ -207,7 +192,6 @@ def test_row_parallel_numerical(seed):
     in_f, out_f = 64, 32
     x_np = rand((8, in_f), seed)
     w_full = rand((out_f, in_f), seed + 1)
-
     layer = RowParallelLinear(in_f, out_f, tp_size=1, tp_rank=0)
     layer.load_weight(jnp.array(w_full))
     out = np.array(layer(jnp.array(x_np)))
@@ -222,4 +206,4 @@ def test_row_parallel_weight_sharding():
         layer = RowParallelLinear(in_f, out_f, tp_size=2, tp_rank=r)
         layer.load_weight(jnp.array(w_full))
         expected = w_full[:, r * 32: (r + 1) * 32]
-        np.testing.assert_allclose(np.array(layer.weight.value), expected, atol=1e-6)
+        np.testing.assert_allclose(np.array(layer.weight[...]), expected, atol=1e-6)
