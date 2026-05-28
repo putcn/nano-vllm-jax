@@ -36,7 +36,7 @@ else
   GPU_FLAG="--gpus device=$GPU_ID"
 fi
 
-docker run --rm -it $GPU_FLAG \
+docker run --rm -i $GPU_FLAG \
   -e HF_HOME=/root/.cache/huggingface \
   -e XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 \
   -e XLA_PYTHON_CLIENT_PREALLOCATE=false \

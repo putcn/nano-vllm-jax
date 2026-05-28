@@ -4,10 +4,10 @@
 # HuggingFace model cache is shared from your host machine.
 #
 # Usage:
-#   bash demo.sh                          # uses Qwen3-0.6B
+#   bash demo.sh
 #   MODEL=Qwen/Qwen3-1.7B bash demo.sh
 #   MODEL=/absolute/local/path bash demo.sh
-#   HF_CACHE=/data/models bash demo.sh    # custom cache dir
+#   HF_CACHE=/data/models bash demo.sh
 #   MAX_TOKENS=128 bash demo.sh
 set -euo pipefail
 
@@ -23,7 +23,7 @@ echo ""
 
 docker build -q -f docker/Dockerfile.cpu -t nano-vllm-jax:cpu . 2>&1 | tail -3
 
-docker run --rm -it \
+docker run --rm -i \
   -e JAX_PLATFORMS=cpu \
   -e HF_HOME=/root/.cache/huggingface \
   -e MODEL="$MODEL" \
