@@ -53,13 +53,16 @@ def get_rope(
         dtype:       output dtype
     Returns:
         (cos, sin) each of shape (max_seq_len, head_dim)
+
+    Note: JAX arrays do not have .cos()/.sin() instance methods;
+          use jnp.cos(x) / jnp.sin(x) (functional API).
     """
     assert head_dim % 2 == 0
     theta = 1.0 / (base ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
     positions = jnp.arange(max_seq_len, dtype=jnp.float32)
-    freqs = jnp.outer(positions, theta)          # (seq, head_dim/2)
-    emb = jnp.concatenate([freqs, freqs], axis=-1)  # (seq, head_dim)
-    return emb.cos().astype(dtype), emb.sin().astype(dtype)
+    freqs = jnp.outer(positions, theta)              # (seq, head_dim/2)
+    emb = jnp.concatenate([freqs, freqs], axis=-1)   # (seq, head_dim)
+    return jnp.cos(emb).astype(dtype), jnp.sin(emb).astype(dtype)
 
 
 class RotaryEmbedding(nnx.Module):

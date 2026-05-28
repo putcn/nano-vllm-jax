@@ -12,6 +12,11 @@ from flax import nnx
 class RMSNorm(nnx.Module):
     """Root Mean Square Layer Normalisation with optional fused residual add.
 
+    Dtype contract: output dtype always matches input x.dtype.
+    The norm computation is promoted to float32 internally for numerical
+    stability, then cast back before multiplying the learned weight.
+    This ensures bf16 / fp16 inputs produce bf16 / fp16 outputs.
+
     Args:
         hidden_size: feature dimension
         eps:         numerical stability epsilon
@@ -41,15 +46,20 @@ class RMSNorm(nnx.Module):
         Args:
             x:        input tensor (..., hidden_size)
             residual: if provided, adds residual to x first (fused path),
-                      and returns (normed, x_after_add) so the caller can
-                      use x_after_add as the next residual.
+                      and returns (normed, x_after_add).
         Returns:
             normed output, or (normed, residual) when residual is not None.
         """
         if residual is not None:
             x = x + residual
             residual = x
-        out = self._norm(x.astype(jnp.float32)).astype(x.dtype) * self.weight[...]
+
+        # Compute norm in float32 for stability, then cast back to input dtype.
+        # Cast weight to input dtype too so the multiply doesn't up-cast the output.
+        normed = self._norm(x.astype(jnp.float32)).astype(x.dtype)
+        weight = self.weight[...].astype(x.dtype)
+        out = normed * weight
+
         if residual is not None:
             return out, residual
         return out

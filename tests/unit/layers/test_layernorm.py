@@ -13,10 +13,12 @@ def rand(shape, seed=0):
 
 
 def torch_rmsnorm(x_np, w_np, eps=1e-6):
+    """Reference RMSNorm via PyTorch. All inputs kept in float32 to avoid
+    dtype-mismatch warnings from PyTorch's RMSNorm kernel."""
     try:
         import torch
-        x = torch.tensor(x_np)
-        w = torch.tensor(w_np)
+        x = torch.tensor(x_np, dtype=torch.float32)
+        w = torch.tensor(w_np, dtype=torch.float32)
         norm = torch.nn.RMSNorm(x_np.shape[-1], eps=eps, elementwise_affine=True)
         norm.weight = torch.nn.Parameter(w)
         return norm(x).detach().numpy()
@@ -37,14 +39,14 @@ def test_numerical_match_float32(seed):
     x_np = rand((8, dim), seed)
     layer = RMSNorm(dim)
     out = np.array(layer(jnp.array(x_np)))
-    ref = torch_rmsnorm(x_np, np.ones(dim))
+    ref = torch_rmsnorm(x_np, np.ones(dim, dtype=np.float32))
     np.testing.assert_allclose(out, ref, atol=1e-5, rtol=1e-5)
 
 
 def test_learned_weight():
     dim = 32
     x_np = rand((4, dim), 0)
-    w_np = rand((dim,), 1) + 1.0
+    w_np = (rand((dim,), 1) + 1.0).astype(np.float32)
     layer = RMSNorm(dim)
     layer.weight = nnx.Param(jnp.array(w_np))
     out = np.array(layer(jnp.array(x_np)))
@@ -59,7 +61,7 @@ def test_fused_residual():
     layer = RMSNorm(dim)
     normed, residual_out = layer(jnp.array(x_np), residual=jnp.array(r_np))
     np.testing.assert_allclose(np.array(residual_out), x_np + r_np, atol=1e-6)
-    ref = torch_rmsnorm(x_np + r_np, np.ones(dim))
+    ref = torch_rmsnorm(x_np + r_np, np.ones(dim, dtype=np.float32))
     np.testing.assert_allclose(np.array(normed), ref, atol=1e-5)
 
 
