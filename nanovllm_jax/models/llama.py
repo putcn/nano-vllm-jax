@@ -121,10 +121,12 @@ class LlamaAttention(nnx.Module):
         seq_lens: jax.Array,
         is_prefill: bool,
         block_table: Optional[jax.Array] = None,
+        num_real_tokens: Optional[int] = None,
+        num_real_seqs: Optional[int] = None,
     ) -> jax.Array:
         T = x.shape[0]
         qkv = self.qkv_proj(x)
-        local_q = self.attn.num_heads
+        local_q  = self.attn.num_heads
         local_kv = self.attn.num_kv_heads
         hd = self.head_dim
         q = qkv[:, :local_q * hd].reshape(T, local_q, hd)
@@ -135,6 +137,8 @@ class LlamaAttention(nnx.Module):
             q, k, v, kv_cache,
             block_indices, block_offsets, seq_lens,
             is_prefill, block_table,
+            num_real_tokens=num_real_tokens,
+            num_real_seqs=num_real_seqs,
         )
         out = out.reshape(out.shape[0], -1)
         return self.o_proj(out)
@@ -167,12 +171,16 @@ class LlamaDecoderLayer(nnx.Module):
         seq_lens: jax.Array,
         is_prefill: bool,
         block_table: Optional[jax.Array] = None,
+        num_real_tokens: Optional[int] = None,
+        num_real_seqs: Optional[int] = None,
     ) -> jax.Array:
         normed, residual = self.input_layernorm(x, residual=jnp.zeros_like(x))
         attn_out = self.self_attn(
             normed, positions, kv_cache,
             block_indices, block_offsets, seq_lens,
             is_prefill, block_table,
+            num_real_tokens=num_real_tokens,
+            num_real_seqs=num_real_seqs,
         )
         normed2, residual2 = self.post_attention_layernorm(attn_out, residual=residual)
         mlp_out = self.mlp(normed2)
@@ -206,9 +214,6 @@ class LlamaModel(nnx.Module):
             config.vocab_size, config.hidden_size,
             tp_size=config.tp_size, tp_rank=config.tp_rank,
         )
-        # nnx.List lets Flax NNX traverse and track nested Module parameters.
-        # A plain Python list is treated as a static attribute and raises
-        # ValueError when it contains Module instances (data in static slot).
         self.layers = nnx.List([
             LlamaDecoderLayer(config, i)
             for i in range(config.num_hidden_layers)
@@ -225,6 +230,8 @@ class LlamaModel(nnx.Module):
         seq_lens: jax.Array,
         is_prefill: bool,
         block_table: Optional[jax.Array] = None,
+        num_real_tokens: Optional[int] = None,
+        num_real_seqs: Optional[int] = None,
     ) -> jax.Array:
         x = self.embed_tokens(input_ids)
         for layer in self.layers:
@@ -232,6 +239,8 @@ class LlamaModel(nnx.Module):
                 x, positions, kv_cache,
                 block_indices, block_offsets, seq_lens,
                 is_prefill, block_table,
+                num_real_tokens=num_real_tokens,
+                num_real_seqs=num_real_seqs,
             )
         return self.norm(x)
 
@@ -270,11 +279,15 @@ class LlamaForCausalLM(nnx.Module):
         is_prefill: bool,
         block_table: Optional[jax.Array] = None,
         last_indices: Optional[jax.Array] = None,
+        num_real_tokens: Optional[int] = None,
+        num_real_seqs: Optional[int] = None,
     ) -> jax.Array:
         hidden = self.model(
             input_ids, positions, kv_cache,
             block_indices, block_offsets, seq_lens,
             is_prefill, block_table,
+            num_real_tokens=num_real_tokens,
+            num_real_seqs=num_real_seqs,
         )
         return self.lm_head(hidden, last_indices=last_indices)
 

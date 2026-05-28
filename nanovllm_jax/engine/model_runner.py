@@ -24,11 +24,9 @@ To avoid recompilation every decode step we **pad all inputs to the next
 power-of-two size** before calling the JIT'd forward function, so the GPU
 sees only O(log N) distinct shapes in practice.
 
-- ``_jit_prefill(model, kv_cache, ids, pos, bi, bo, seq_lens)``
-  Padded to the next power-of-two token count.
-
-- ``_jit_decode(model, kv_cache, ids, pos, bi, bo, seq_lens, block_table)``
-  Padded to the next power-of-two batch size and block-table width.
+num_real_tokens / num_real_seqs are passed as Python ints (static values)
+so Attention can slice to real data before writing the KV cache, preventing
+padding tokens from corrupting valid cache entries.
 
 Public helpers
 --------------
@@ -47,13 +45,15 @@ if TYPE_CHECKING:
 
 from nanovllm_jax.engine.sequence import Sequence
 
+import jax
+import jax.numpy as jnp
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _next_pow2(n: int) -> int:
-    """Smallest power of 2 >= n (minimum 1)."""
     if n <= 1:
         return 1
     p = 1
@@ -67,14 +67,12 @@ def _next_pow2(n: int) -> int:
 # ---------------------------------------------------------------------------
 
 class _StubModel:
-    """Returns logits that argmax to eos_token_id — deterministic, terminates fast."""
     def __init__(self, vocab_size: int = 256, eos_token_id: int = 2):
         self.vocab_size = vocab_size
         self.eos_token_id = eos_token_id
         self.config = type("C", (), {"vocab_size": vocab_size})()
 
     def __call__(self, *args, **kwargs):
-        import jax.numpy as jnp
         batch = args[0].shape[0] if args else 1
         logits = jnp.zeros((batch, self.vocab_size))
         logits = logits.at[:, self.eos_token_id].set(1.0)
@@ -86,28 +84,26 @@ class _StubModel:
 
 # ---------------------------------------------------------------------------
 # JIT-compiled forward functions
+# num_real_tokens / num_real_seqs are static so XLA can use them as
+# compile-time slice bounds inside Attention.__call__.
 # ---------------------------------------------------------------------------
-# We use module-level @functools.partial(jax.jit) functions rather than
-# methods so that JAX can trace them cleanly without capturing `self`.
-# The model and kv_cache are passed as regular arguments; JAX traces on
-# their *structure* (pytree) and recompiles only when shapes change.
 
-import jax
-import jax.numpy as jnp
-
-
-@functools.partial(jax.jit, static_argnums=())
-def _jit_prefill(model, kv_cache, ids, pos, bi, bo, seq_lens):
-    """JIT-compiled prefill forward pass. Returns full logit matrix."""
-    return model(ids, pos, kv_cache, bi, bo, seq_lens, is_prefill=True)
-
-
-@functools.partial(jax.jit, static_argnums=())
-def _jit_decode(model, kv_cache, ids, pos, bi, bo, seq_lens, block_table):
-    """JIT-compiled decode forward pass. Returns full logit matrix."""
+@functools.partial(jax.jit, static_argnames=("num_real_tokens",))
+def _jit_prefill(model, kv_cache, ids, pos, bi, bo, seq_lens, *, num_real_tokens):
     return model(
         ids, pos, kv_cache, bi, bo, seq_lens,
-        is_prefill=False, block_table=block_table,
+        is_prefill=True,
+        num_real_tokens=num_real_tokens,
+    )
+
+
+@functools.partial(jax.jit, static_argnames=("num_real_seqs",))
+def _jit_decode(model, kv_cache, ids, pos, bi, bo, seq_lens, block_table, *, num_real_seqs):
+    return model(
+        ids, pos, kv_cache, bi, bo, seq_lens,
+        is_prefill=False,
+        block_table=block_table,
+        num_real_seqs=num_real_seqs,
     )
 
 
@@ -116,24 +112,6 @@ def _jit_decode(model, kv_cache, ids, pos, bi, bo, seq_lens, block_table):
 # ---------------------------------------------------------------------------
 
 class ModelRunner:
-    """Wraps model loading, input array construction, and forward pass.
-
-    Accepts **two** different calling conventions:
-
-    *Config mode* (used by LLMEngine)::
-
-        runner = ModelRunner(config)   # EngineConfig
-
-    *Direct mode* (used by unit tests — avoids loading a real checkpoint)::
-
-        runner = ModelRunner(
-            model=<model_or_None>,
-            kv_cache=<PagedKVCache>,
-            block_manager=<BlockManager>,
-            block_size=<int>,
-        )
-    """
-
     def __init__(
         self,
         config: Optional["EngineConfig"] = None,
@@ -157,8 +135,6 @@ class ModelRunner:
             self._model = model
             self._kv_cache = kv_cache
             self._block_manager = block_manager
-
-    # ---- lazy init (config mode) ----------------------------------------
 
     def _ensure_model(self):
         if self._model is not None:
@@ -201,13 +177,11 @@ class ModelRunner:
 
     @staticmethod
     def _pad1d(arr, target_len: int, val: int = 0):
-        """Pad a 1-D int array to target_len."""
         pad = target_len - arr.shape[0]
         return jnp.pad(arr, (0, pad), constant_values=val)
 
     @staticmethod
     def _pad2d(arr, target_rows: int, target_cols: int, val: int = 0):
-        """Pad a 2-D int array to (target_rows, target_cols)."""
         pr = target_rows - arr.shape[0]
         pc = target_cols - arr.shape[1]
         return jnp.pad(arr, ((0, pr), (0, pc)), constant_values=val)
@@ -215,12 +189,6 @@ class ModelRunner:
     # ---- input builders -------------------------------------------------
 
     def _build_prefill_inputs(self, seqs: List[Sequence]) -> Tuple:
-        """Pack multiple prefill sequences into flat JAX arrays.
-
-        Returns:
-            (seqs, token_ids, positions, block_indices, block_offsets,
-             seq_lens, last_indices)
-        """
         all_ids: List[int] = []
         all_pos: List[int] = []
         all_bi:  List[int] = []
@@ -252,14 +220,6 @@ class ModelRunner:
         )
 
     def _build_decode_inputs(self, seqs: List[Sequence]) -> Tuple:
-        """Build one-token-per-sequence decode arrays.
-
-        Returns:
-            (seqs, token_ids, positions, block_indices, block_offsets,
-             seq_lens, block_table)
-
-        block_table is 2-D int32 [B, max_blocks], padded with 0.
-        """
         ids:   List[int] = []
         pos:   List[int] = []
         bi:    List[int] = []
@@ -291,7 +251,6 @@ class ModelRunner:
     # ---- forward pass ---------------------------------------------------
 
     def run(self, prefill_seqs: List[Sequence], decode_seqs: List[Sequence]) -> Dict[int, int]:
-        """Run one forward step; return {seq_id: next_token_id}."""
         self._ensure_model()
         results: Dict[int, int] = {}
         if prefill_seqs:
@@ -307,17 +266,20 @@ class ModelRunner:
 
         _, ids, pos, bi, bo, seq_lens, last_idx = self._build_prefill_inputs(seqs)
 
-        # Pad token dimension to next power-of-2 to minimise JIT recompilation.
-        T = ids.shape[0]
-        T_pad = _next_pow2(T)
-        if T_pad != T:
-            ids     = self._pad1d(ids,  T_pad)
-            pos     = self._pad1d(pos,  T_pad)
-            bi      = self._pad1d(bi,   T_pad)
-            bo      = self._pad1d(bo,   T_pad)
+        T_real = ids.shape[0]
+        T_pad  = _next_pow2(T_real)
+        if T_pad != T_real:
+            ids = self._pad1d(ids, T_pad)
+            pos = self._pad1d(pos, T_pad)
+            bi  = self._pad1d(bi,  T_pad)
+            bo  = self._pad1d(bo,  T_pad)
 
-        logits = _jit_prefill(self._model, self._kv_cache, ids, pos, bi, bo, seq_lens)
-        # logits shape: [T_pad, vocab] — read only at the real last-token positions
+        logits = _jit_prefill(
+            self._model, self._kv_cache,
+            ids, pos, bi, bo, seq_lens,
+            num_real_tokens=T_real,
+        )
+        # logits: [T_pad, vocab] but only real positions are meaningful
         return {seq.seq_id: int(jnp.argmax(logits[last_idx[i]])) for i, seq in enumerate(seqs)}
 
     def _run_decode(self, seqs: List[Sequence]) -> Dict[int, int]:
@@ -327,22 +289,22 @@ class ModelRunner:
 
         _, ids, pos, bi, bo, seq_lens, block_table = self._build_decode_inputs(seqs)
 
-        # Pad batch and block-table width to next power-of-2.
-        B  = ids.shape[0]
-        BT = block_table.shape[1]
-        B_pad  = _next_pow2(B)
-        BT_pad = _next_pow2(BT)
-        if B_pad != B or BT_pad != BT:
-            ids         = self._pad1d(ids,   B_pad)
-            pos         = self._pad1d(pos,   B_pad)
-            bi          = self._pad1d(bi,    B_pad)
-            bo          = self._pad1d(bo,    B_pad)
-            seq_lens    = self._pad1d(seq_lens, B_pad, val=1)  # avoid div-by-zero
+        B_real  = ids.shape[0]
+        BT_real = block_table.shape[1]
+        B_pad   = _next_pow2(B_real)
+        BT_pad  = _next_pow2(BT_real)
+        if B_pad != B_real or BT_pad != BT_real:
+            ids         = self._pad1d(ids,      B_pad)
+            pos         = self._pad1d(pos,      B_pad)
+            bi          = self._pad1d(bi,       B_pad)
+            bo          = self._pad1d(bo,       B_pad)
+            seq_lens    = self._pad1d(seq_lens, B_pad, val=1)
             block_table = self._pad2d(block_table, B_pad, BT_pad)
 
         logits = _jit_decode(
             self._model, self._kv_cache,
             ids, pos, bi, bo, seq_lens, block_table,
+            num_real_seqs=B_real,
         )
-        # logits shape: [B_pad, vocab] — read only the first B real rows
+        # logits: [B_pad, vocab] — read only real rows
         return {seq.seq_id: int(jnp.argmax(logits[i])) for i, seq in enumerate(seqs)}
