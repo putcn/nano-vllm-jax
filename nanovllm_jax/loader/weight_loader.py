@@ -1,127 +1,53 @@
-"""HuggingFace weight loader for nano-vllm-jax.
-
-Status: ✅ Done (Phase 5)
+"""HuggingFace weight loader (Phase 5).
 
 Supports:
-  - safetensors (preferred, mmap-friendly)
-  - pytorch_model.bin / model.bin (torch.load fallback)
-  - Sharded checkpoints via model.safetensors.index.json
-    or pytorch_model.bin.index.json
+- safetensors shards (model-00001-of-NNNNN.safetensors)
+- pytorch_model.bin shards
+- single model.safetensors / pytorch_model.bin
 
-Usage::
-
-    from nanovllm_jax.loader.weight_loader import load_hf_weights
-    from nanovllm_jax.models.llama import LlamaForCausalLM, LlamaConfig
-
-    config = LlamaConfig(...)
-    model  = LlamaForCausalLM(config)
-    load_hf_weights(model, "/path/to/hf/model")
+Also exports config builders:
+- llama_config_from_hf   -- Llama / Mistral / CodeLlama
+- qwen_config_from_hf    -- Qwen2 / Qwen3 (same weight key layout)
 """
 from __future__ import annotations
-import json
-import os
 from pathlib import Path
 from typing import Iterator
-
-import numpy as np
-
-
-# ---------------------------------------------------------------------------
-# Shard iterator
-# ---------------------------------------------------------------------------
-
-def _iter_safetensors(path: Path) -> Iterator[tuple[str, np.ndarray]]:
-    """Yield (name, numpy_array) from a single .safetensors file."""
-    try:
-        from safetensors import safe_open
-    except ImportError as e:
-        raise ImportError(
-            "safetensors not installed. Run: pip install safetensors"
-        ) from e
-    with safe_open(str(path), framework="numpy") as f:
-        for key in f.keys():
-            yield key, f.get_tensor(key)
+import json
 
 
-def _iter_pytorch_bin(path: Path) -> Iterator[tuple[str, np.ndarray]]:
-    """Yield (name, numpy_array) from a pytorch .bin file."""
-    try:
-        import torch
-    except ImportError as e:
-        raise ImportError(
-            "torch not installed. Run: pip install torch --index-url https://download.pytorch.org/whl/cpu"
-        ) from e
-    state = torch.load(str(path), map_location="cpu", weights_only=True)
-    for key, tensor in state.items():
-        yield key, tensor.float().numpy()
-
-
-def _shard_files(model_dir: Path) -> list[Path]:
-    """Return ordered list of weight shard files in model_dir."""
-    # 1. Prefer safetensors
+def _iter_shard_paths(model_dir: Path) -> Iterator[Path]:
+    """Yield shard file paths in order (safetensors preferred over bin)."""
     index_st = model_dir / "model.safetensors.index.json"
+    index_bin = model_dir / "pytorch_model.bin.index.json"
     single_st = model_dir / "model.safetensors"
+    single_bin = model_dir / "pytorch_model.bin"
+
     if index_st.exists():
         with open(index_st) as f:
-            index = json.load(f)
-        # weight_map values are filenames; deduplicate while preserving order
-        seen: dict[str, None] = {}
-        for fname in index["weight_map"].values():
-            seen[fname] = None
-        return [model_dir / fname for fname in seen]
-    if single_st.exists():
-        return [single_st]
+            mapping = json.load(f)["weight_map"]
+        seen: set[str] = set()
+        for fname in mapping.values():
+            if fname not in seen:
+                seen.add(fname)
+                yield model_dir / fname
+    elif index_bin.exists():
+        with open(index_bin) as f:
+            mapping = json.load(f)["weight_map"]
+        seen = set()
+        for fname in mapping.values():
+            if fname not in seen:
+                seen.add(fname)
+                yield model_dir / fname
+    elif single_st.exists():
+        yield single_st
+    elif single_bin.exists():
+        yield single_bin
+    else:
+        raise FileNotFoundError(
+            f"No weight files found in {model_dir}. "
+            "Expected model.safetensors[.index.json] or pytorch_model.bin[.index.json]."
+        )
 
-    # 2. Fallback: pytorch bin
-    index_pt = model_dir / "pytorch_model.bin.index.json"
-    single_pt = model_dir / "pytorch_model.bin"
-    if index_pt.exists():
-        with open(index_pt) as f:
-            index = json.load(f)
-        seen = {}
-        for fname in index["weight_map"].values():
-            seen[fname] = None
-        return [model_dir / fname for fname in seen]
-    if single_pt.exists():
-        return [single_pt]
-
-    raise FileNotFoundError(
-        f"No weight files found in {model_dir}. "
-        "Expected model.safetensors[.index.json] or pytorch_model.bin[.index.json]."
-    )
-
-
-def _iter_shards(model_dir: Path) -> Iterator[tuple[str, np.ndarray]]:
-    """Iterate over all (name, array) pairs across all shards."""
-    for shard_path in _shard_files(model_dir):
-        if shard_path.suffix == ".safetensors":
-            yield from _iter_safetensors(shard_path)
-        else:
-            yield from _iter_pytorch_bin(shard_path)
-
-
-# ---------------------------------------------------------------------------
-# Key remapping
-# ---------------------------------------------------------------------------
-
-# Some HF checkpoints use slightly different key prefixes.
-# Add entries here as new model variants are supported.
-_KEY_REMAP: list[tuple[str, str]] = [
-    # Llama-3 uses the same keys, no remap needed.
-    # ("old_prefix.", "new_prefix."),
-]
-
-
-def _remap_key(key: str) -> str:
-    for old, new in _KEY_REMAP:
-        if key.startswith(old):
-            return new + key[len(old):]
-    return key
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 def load_hf_weights(
     model,
@@ -130,64 +56,99 @@ def load_hf_weights(
     dtype: str = "float32",
     verbose: bool = False,
 ) -> None:
-    """Load HuggingFace weights from *model_dir* into *model* in-place.
+    """Load all shards into *model* via ``model.load_weights(params_dict)``.
 
     Args:
-        model:     A model instance with a ``load_weights(params)`` method
-                   (e.g. ``LlamaForCausalLM``).
-        model_dir: Directory containing the HF checkpoint.
-        dtype:     Cast weights to this numpy dtype before passing to JAX.
-                   Default ``'float32'``; use ``'bfloat16'`` for large models.
-        verbose:   Print each loaded tensor name and shape.
+        model:     An instance with a ``load_weights(dict)`` method.
+        model_dir: HuggingFace checkpoint directory.
+        dtype:     Target dtype (``'float32'`` or ``'bfloat16'``).
+        verbose:   Print each tensor name as it is loaded.
     """
+    import numpy as np
     model_dir = Path(model_dir)
-    if not model_dir.is_dir():
-        raise NotADirectoryError(f"{model_dir} is not a directory")
+    all_params: dict = {}
 
-    params: dict[str, np.ndarray] = {}
-    np_dtype = np.dtype(dtype)
-
-    for name, arr in _iter_shards(model_dir):
-        name = _remap_key(name)
-        params[name] = arr.astype(np_dtype)
+    for shard_path in _iter_shard_paths(model_dir):
         if verbose:
-            print(f"  loaded {name:80s} {arr.shape}")
+            print(f"  loading shard: {shard_path.name}")
+        if shard_path.suffix == ".safetensors":
+            from safetensors.numpy import load_file
+            tensors = load_file(str(shard_path))
+        else:
+            import torch
+            raw = torch.load(str(shard_path), map_location="cpu")
+            tensors = {k: v.numpy() for k, v in raw.items()}
 
-    model.load_weights(params)
-    if verbose:
-        print(f"\nLoaded {len(params)} tensors from {model_dir}")
+        for name, arr in tensors.items():
+            if verbose:
+                print(f"    {name}: {arr.shape} {arr.dtype}")
+            if dtype == "bfloat16":
+                arr = arr.astype(np.float32)  # JAX doesn't read bf16 from numpy
+            all_params[name] = arr
+
+    model.load_weights(all_params)
 
 
-def load_hf_config(model_dir: str | Path) -> dict:
-    """Read config.json from a HuggingFace model directory.
-
-    Returns the raw dict; callers map fields to ``LlamaConfig`` themselves.
-    """
-    cfg_path = Path(model_dir) / "config.json"
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"config.json not found in {model_dir}")
-    with open(cfg_path) as f:
-        return json.load(f)
-
+# ---------------------------------------------------------------------------
+# Config builders
+# ---------------------------------------------------------------------------
 
 def llama_config_from_hf(model_dir: str | Path):
-    """Build a ``LlamaConfig`` from a HuggingFace config.json.
+    """Build LlamaConfig from a HuggingFace Llama / Mistral config.json."""
+    from nanovllm_jax.models.llama import LlamaConfig
+    model_dir = Path(model_dir)
+    with open(model_dir / "config.json") as f:
+        cfg = json.load(f)
 
-    Supports Llama-1/2/3 config field names.
+    return LlamaConfig(
+        hidden_size=cfg["hidden_size"],
+        intermediate_size=cfg["intermediate_size"],
+        num_hidden_layers=cfg["num_hidden_layers"],
+        num_attention_heads=cfg["num_attention_heads"],
+        num_key_value_heads=cfg.get("num_key_value_heads", cfg["num_attention_heads"]),
+        head_dim=cfg.get("head_dim"),
+        max_position_embeddings=cfg.get("max_position_embeddings", 4096),
+        rms_norm_eps=cfg.get("rms_norm_eps", 1e-5),
+        vocab_size=cfg["vocab_size"],
+        rope_theta=cfg.get("rope_theta", 10000.0),
+        tie_word_embeddings=cfg.get("tie_word_embeddings", False),
+    )
+
+
+def qwen_config_from_hf(model_dir: str | Path):
+    """Build LlamaConfig from a HuggingFace Qwen2 / Qwen3 config.json.
+
+    Qwen2 / Qwen3 use the identical Llama-style weight key layout but their
+    ``config.json`` may have slightly different field names.  We normalise
+    them here and re-use ``LlamaConfig`` as the internal representation.
+
+    Notable differences:
+    - ``head_dim`` is explicit in Qwen3 (128 for most sizes)
+    - ``rms_norm_eps`` is typically 1e-6 instead of 1e-5
+    - ``rope_theta`` is 1_000_000 for Qwen3
+    - ``tie_word_embeddings`` is False for all public Qwen3 checkpoints
     """
     from nanovllm_jax.models.llama import LlamaConfig
+    model_dir = Path(model_dir)
+    with open(model_dir / "config.json") as f:
+        cfg = json.load(f)
 
-    raw = load_hf_config(model_dir)
+    num_heads = cfg["num_attention_heads"]
+    num_kv_heads = cfg.get("num_key_value_heads", num_heads)
+    hidden_size = cfg["hidden_size"]
+    # Qwen3 exposes head_dim directly; fall back to hidden_size // num_heads
+    head_dim = cfg.get("head_dim", hidden_size // num_heads)
+
     return LlamaConfig(
-        hidden_size=raw["hidden_size"],
-        intermediate_size=raw["intermediate_size"],
-        num_hidden_layers=raw["num_hidden_layers"],
-        num_attention_heads=raw["num_attention_heads"],
-        num_key_value_heads=raw.get("num_key_value_heads", raw["num_attention_heads"]),
-        head_dim=raw.get("head_dim"),  # None = infer
-        max_position_embeddings=raw["max_position_embeddings"],
-        rms_norm_eps=raw.get("rms_norm_eps", 1e-5),
-        vocab_size=raw["vocab_size"],
-        rope_theta=raw.get("rope_theta", 10000.0),
-        tie_word_embeddings=raw.get("tie_word_embeddings", False),
+        hidden_size=hidden_size,
+        intermediate_size=cfg["intermediate_size"],
+        num_hidden_layers=cfg["num_hidden_layers"],
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        head_dim=head_dim,
+        max_position_embeddings=cfg.get("max_position_embeddings", 32768),
+        rms_norm_eps=cfg.get("rms_norm_eps", 1e-6),
+        vocab_size=cfg["vocab_size"],
+        rope_theta=cfg.get("rope_theta", 1_000_000.0),
+        tie_word_embeddings=cfg.get("tie_word_embeddings", False),
     )

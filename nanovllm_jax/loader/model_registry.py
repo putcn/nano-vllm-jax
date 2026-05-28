@@ -2,6 +2,18 @@
 
 Status: ✅ Done (Phase 5)
 
+Supported architectures
+-----------------------
+- LlamaForCausalLM   (Llama 2/3, CodeLlama, etc.)
+- MistralForCausalLM (Mistral 7B, Mixtral via dense view)
+- Qwen3ForCausalLM   (Qwen3-0.6B / 1.7B / 4B / 8B / 14B / 32B)
+- Qwen2ForCausalLM   (Qwen2-0.5B / 1.5B / 7B / 72B)
+
+All Qwen2/Qwen3 models share the LlamaForCausalLM backbone (identical
+architecture: RMSNorm + GQA + SwiGLU + RoPE) with a compatible weight
+key layout.  They only differ in config field names, handled by
+``qwen_config_from_hf``.
+
 Usage::
 
     from nanovllm_jax.loader.model_registry import load_model
@@ -12,22 +24,11 @@ from pathlib import Path
 from typing import Type
 
 
-# Registry: HF architectures -> (model_class, config_builder)
-# Extend this dict to add new model families.
 _REGISTRY: dict[str, tuple] = {}
 
 
 def register(hf_arch: str):
-    """Decorator to register a (model_cls, config_fn) pair.
-
-    Usage::
-
-        @register("LlamaForCausalLM")
-        def _():
-            from nanovllm_jax.models.llama import LlamaForCausalLM
-            from nanovllm_jax.loader.weight_loader import llama_config_from_hf
-            return LlamaForCausalLM, llama_config_from_hf
-    """
+    """Decorator to register a (model_cls, config_builder) pair."""
     def decorator(fn):
         _REGISTRY[hf_arch] = fn
         return fn
@@ -41,7 +42,6 @@ def _llama():
     return LlamaForCausalLM, llama_config_from_hf
 
 
-# Mistral uses Llama architecture with GQA
 @register("MistralForCausalLM")
 def _mistral():
     from nanovllm_jax.models.llama import LlamaForCausalLM
@@ -49,13 +49,25 @@ def _mistral():
     return LlamaForCausalLM, llama_config_from_hf
 
 
+@register("Qwen2ForCausalLM")
+def _qwen2():
+    from nanovllm_jax.models.llama import LlamaForCausalLM
+    from nanovllm_jax.loader.weight_loader import qwen_config_from_hf
+    return LlamaForCausalLM, qwen_config_from_hf
+
+
+@register("Qwen3ForCausalLM")
+def _qwen3():
+    from nanovllm_jax.models.llama import LlamaForCausalLM
+    from nanovllm_jax.loader.weight_loader import qwen_config_from_hf
+    return LlamaForCausalLM, qwen_config_from_hf
+
+
 def get_model_class(hf_arch: str):
-    """Return (ModelClass, config_builder_fn) for the given HF architecture."""
     if hf_arch not in _REGISTRY:
         supported = ", ".join(sorted(_REGISTRY))
         raise ValueError(
-            f"Unsupported architecture: {hf_arch!r}. "
-            f"Supported: {supported}"
+            f"Unsupported architecture: {hf_arch!r}. Supported: {supported}"
         )
     model_cls, config_fn = _REGISTRY[hf_arch]()
     return model_cls, config_fn
@@ -67,16 +79,7 @@ def load_model(
     dtype: str = "float32",
     verbose: bool = False,
 ):
-    """Auto-detect architecture from config.json and return an initialized model.
-
-    Args:
-        model_dir: HuggingFace checkpoint directory.
-        dtype:     Weight dtype (``'float32'`` or ``'bfloat16'``).
-        verbose:   Print loaded tensor names.
-
-    Returns:
-        Initialized model with weights loaded.
-    """
+    """Auto-detect architecture from config.json and return an initialized model."""
     import json
     from nanovllm_jax.loader.weight_loader import load_hf_weights
 
