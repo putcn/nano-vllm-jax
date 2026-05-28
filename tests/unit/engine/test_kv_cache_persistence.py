@@ -39,6 +39,14 @@ def make_cache(num_layers=2, num_kv_heads=2, head_dim=8,
     )
 
 
+def _cache_val(cache: PagedKVCache):
+    """Get the underlying array from cache.cache (nnx.Variable)."""
+    c = cache.cache
+    if hasattr(c, 'get_value'):
+        return c.get_value()
+    return c.value  # fallback for older Flax
+
+
 # ---------------------------------------------------------------------------
 # Test 1: cache write inside nnx.jit persists outside the call
 # ---------------------------------------------------------------------------
@@ -59,14 +67,12 @@ def test_nnx_jit_cache_write_persists():
     k_val = jnp.ones((1, 2, 8), dtype=jnp.float32) * 3.14
     v_val = jnp.ones((1, 2, 8), dtype=jnp.float32) * 2.71
 
-    # Before write: cache should be all zeros
-    assert jnp.allclose(cache.cache.value[layer, 0, 0, 0], jnp.zeros((2, 8)))
+    assert jnp.allclose(_cache_val(cache)[layer, 0, 0, 0], jnp.zeros((2, 8)))
 
     _write_cache(cache, layer, bi, bo, k_val, v_val)
 
-    # After write: cache must reflect the written values
-    k_stored = cache.cache.value[layer, 0, 0, 0]  # [num_kv_heads, head_dim]
-    v_stored = cache.cache.value[layer, 1, 0, 0]
+    k_stored = _cache_val(cache)[layer, 0, 0, 0]
+    v_stored = _cache_val(cache)[layer, 1, 0, 0]
     assert jnp.allclose(k_stored, k_val[0]), (
         f"KV cache write not persisted! Expected {k_val[0]}, got {k_stored}"
     )
@@ -85,12 +91,7 @@ def _write_cache_jit(cache: PagedKVCache, layer: int,
 
 
 def test_jax_jit_cache_write_does_not_persist():
-    """Documents that jax.jit does NOT persist nnx.Variable mutations.
-
-    This is the original bug: jax.jit traces functions purely-functionally.
-    Any Python-level object mutation (self.cache = nnx.Variable(new_cache))
-    inside a jitted function is NOT propagated back to the outer scope.
-    """
+    """Documents that jax.jit does NOT persist nnx.Variable mutations."""
     cache = make_cache()
     layer = 0
     bi = jnp.array([0], dtype=jnp.int32)
@@ -100,8 +101,7 @@ def test_jax_jit_cache_write_does_not_persist():
 
     _write_cache_jit(cache, layer, bi, bo, k_val, v_val)
 
-    k_stored = cache.cache.value[layer, 0, 0, 0]
-    # Under jax.jit the write is NOT persisted — cache should still be zeros.
+    k_stored = _cache_val(cache)[layer, 0, 0, 0]
     assert not jnp.allclose(k_stored, k_val[0]), (
         "Unexpected: jax.jit DID persist the cache write. "
         "JAX behaviour may have changed — review model_runner.py."
@@ -152,18 +152,14 @@ def test_decode_reads_prefill_kv_cache():
     cache = make_cache(num_kv_heads=NH, head_dim=HD, block_size=BS)
     attn = Attention(num_heads=NH, head_dim=HD, num_kv_heads=NH, layer_idx=0)
 
-    T = 3  # 3 prefill tokens
-    key = jax.random.PRNGKey(0)
-    q_pre = jax.random.normal(key, (T, NH, HD))
+    T = 3
+    q_pre = jax.random.normal(jax.random.PRNGKey(0), (T, NH, HD))
     k_pre = jax.random.normal(jax.random.PRNGKey(1), (T, NH, HD))
     v_pre = jax.random.normal(jax.random.PRNGKey(2), (T, NH, HD))
-
     q_dec = jax.random.normal(jax.random.PRNGKey(3), (1, NH, HD))
     k_dec = jax.random.normal(jax.random.PRNGKey(4), (1, NH, HD))
     v_dec = jax.random.normal(jax.random.PRNGKey(5), (1, NH, HD))
 
-    # Block layout: tokens 0,1,2 fit in block 0 (positions 0,1,2)
-    # decode token goes to block 0 position 3
     bi_pre = jnp.array([0, 0, 0], dtype=jnp.int32)
     bo_pre = jnp.array([0, 1, 2], dtype=jnp.int32)
     bi_dec = jnp.array([0], dtype=jnp.int32)
@@ -181,9 +177,6 @@ def test_decode_reads_prefill_kv_cache():
         bi_pre, bo_pre, bi_dec, bo_dec,
     )
 
-    # Decode output must be non-zero: it attended over the prefill KV cache.
-    # If the cache was all-zeros (jax.jit bug), the softmax would be uniform
-    # over zero-valued v vectors, producing ~zero output.
     assert not jnp.allclose(out_dec, jnp.zeros_like(out_dec), atol=1e-4), (
         "Decode output is all-zeros. KV cache from prefill was not persisted. "
         "Ensure model_runner uses nnx.jit."
@@ -195,34 +188,22 @@ def test_decode_reads_prefill_kv_cache():
 # ---------------------------------------------------------------------------
 
 def test_zero_seq_lens_padding_does_not_corrupt_decode():
-    """Padding sequences (seq_lens=0) should produce zero attention output
-    and must NOT affect the real sequences.
-    """
+    """Padding sequences (seq_lens=0) must NOT affect real sequences."""
     NH, HD, BS = 2, 8, 4
     cache = make_cache(num_kv_heads=NH, head_dim=HD, block_size=BS)
     attn = Attention(num_heads=NH, head_dim=HD, num_kv_heads=NH, layer_idx=0)
 
-    # One real sequence (seq_len=4), one padding sequence (seq_len=0)
-    # We call _decode directly with B_real=1 so padding is ignored.
-    key = jax.random.PRNGKey(42)
-    q = jax.random.normal(key, (1, NH, HD))
-    # Build a non-trivial k/v cache for the real sequence
+    q = jax.random.normal(jax.random.PRNGKey(42), (1, NH, HD))
     k_ctx = jax.random.normal(jax.random.PRNGKey(10), (1, 4, NH, HD))
     v_ctx = jax.random.normal(jax.random.PRNGKey(11), (1, 4, NH, HD))
     seq_lens = jnp.array([4], dtype=jnp.int32)
 
     out_real = attn._decode(q, k_ctx, v_ctx, seq_lens)
 
-    # Compute again with seq_lens=0 — output should be near-zero (no valid KV)
     seq_lens_zero = jnp.array([0], dtype=jnp.int32)
     out_zero = attn._decode(q, k_ctx, v_ctx, seq_lens_zero)
 
-    # Real output should be meaningful (non-zero)
     assert not jnp.allclose(out_real, jnp.zeros_like(out_real), atol=1e-4)
-    # Zero-seq-len output should be essentially zero (all logits = -inf → softmax = 0)
-    # Numerically softmax([-inf,...,-inf]) in float32 can produce NaN or 0;
-    # either way it must not equal out_real.
     assert not jnp.allclose(out_zero, out_real, atol=1e-4), (
-        "seq_lens=0 padding produced same output as seq_lens=4. "
-        "Padding may be corrupting real sequence results."
+        "seq_lens=0 padding produced same output as seq_lens=4."
     )

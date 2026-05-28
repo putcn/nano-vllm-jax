@@ -26,16 +26,19 @@ Shape contract
 __call__ always returns the same leading dimension as the input q:
   prefill : (T_pad, num_heads, head_dim) — padding rows are zero
   decode  : (B_pad, num_heads, head_dim) — padding rows are zero
-
-This keeps all downstream layers (residual adds, layernorm) shape-stable.
-num_real_tokens / num_real_seqs only govern which slots are written to
-the KV cache; they do NOT change the output tensor shape.
 """
 from __future__ import annotations
 from typing import Optional
 import jax
 import jax.numpy as jnp
 from flax import nnx
+
+
+def _get_variable(v):
+    """Compatibility shim: get array from nnx.Variable regardless of Flax version."""
+    if hasattr(v, 'get_value'):
+        return v.get_value()
+    return v.value  # fallback for older Flax
 
 
 # ---------------------------------------------------------------------------
@@ -47,12 +50,6 @@ class PagedKVCache(nnx.Module):
 
     Layout: cache[layer, 2, num_blocks, block_size, num_kv_heads, head_dim]
       - dim 1: 0 = keys, 1 = values
-
-    Mutability note
-    ---------------
-    write() assigns self.cache = nnx.Variable(new_cache). This is a Python-
-    level object mutation. It is only propagated correctly when the containing
-    forward function is compiled with nnx.jit (not jax.jit). See model_runner.py.
     """
 
     def __init__(
@@ -79,18 +76,12 @@ class PagedKVCache(nnx.Module):
     def write(
         self,
         layer_idx: int,
-        block_indices: jax.Array,   # (num_real_tokens,) int32
-        block_offsets: jax.Array,   # (num_real_tokens,) int32
-        keys: jax.Array,            # (num_real_tokens, num_kv_heads, head_dim)
-        values: jax.Array,          # (num_real_tokens, num_kv_heads, head_dim)
+        block_indices: jax.Array,
+        block_offsets: jax.Array,
+        keys: jax.Array,
+        values: jax.Array,
     ) -> None:
-        """Write *real* tokens into the cache.  Padding tokens must NOT be included.
-
-        This method mutates self.cache (an nnx.Variable). The mutation is
-        propagated back to the outer Python scope only when called inside
-        an nnx.jit-compiled function (not jax.jit).
-        """
-        cache = self.cache.value
+        cache = _get_variable(self.cache)
         num_real = keys.shape[0]
 
         def body(i, c):
@@ -106,11 +97,10 @@ class PagedKVCache(nnx.Module):
     def read(
         self,
         layer_idx: int,
-        block_table: jax.Array,   # (num_real_seqs, max_blocks_per_seq) int32
-        seq_lens: jax.Array,      # (num_real_seqs,) int32
+        block_table: jax.Array,
+        seq_lens: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
-        """Read cached KV for *real* sequences only."""
-        cache = self.cache.value
+        cache = _get_variable(self.cache)
         k_cache = cache[layer_idx, 0]
         v_cache = cache[layer_idx, 1]
 
@@ -146,75 +136,58 @@ class Attention(nnx.Module):
         self.scale        = scale or (head_dim ** -0.5)
         self.kv_groups    = self.num_heads // self.num_kv_heads
 
-    # ------------------------------------------------------------------
-    # Prefill: causal attention over T_real tokens
-    # Returns (T_real, num_heads, head_dim) — caller pads back to T_pad
-    # ------------------------------------------------------------------
-
     def _prefill(
         self,
-        q: jax.Array,         # (T_real, num_heads, head_dim)
-        k: jax.Array,         # (T_real, num_kv_heads, head_dim)
-        v: jax.Array,         # (T_real, num_kv_heads, head_dim)
-        seq_lens: jax.Array,  # (num_seqs,) int32
-    ) -> jax.Array:           # (T_real, num_heads, head_dim)
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        seq_lens: jax.Array,
+    ) -> jax.Array:
         T = q.shape[0]
         if self.kv_groups > 1:
             k = jnp.repeat(k, self.kv_groups, axis=1)
             v = jnp.repeat(v, self.kv_groups, axis=1)
 
-        q_t = jnp.transpose(q, (1, 0, 2))  # (H, T, D)
-        k_t = jnp.transpose(k, (1, 2, 0))  # (H, D, T)
-        logits = jnp.matmul(q_t, k_t) * self.scale  # (H, T, T)
+        q_t = jnp.transpose(q, (1, 0, 2))
+        k_t = jnp.transpose(k, (1, 2, 0))
+        logits = jnp.matmul(q_t, k_t) * self.scale
 
         mask   = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
         logits = jnp.where(mask[None, :, :], logits, jnp.finfo(jnp.float32).min)
 
         attn = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
-        v_t  = jnp.transpose(v, (1, 0, 2))   # (H, T, D)
-        out  = jnp.matmul(attn, v_t)          # (H, T, D)
-        return jnp.transpose(out, (1, 0, 2))  # (T, H, D)
-
-    # ------------------------------------------------------------------
-    # Decode: single token per real sequence
-    # Returns (B_real, num_heads, head_dim) — caller pads back to B_pad
-    # ------------------------------------------------------------------
+        v_t  = jnp.transpose(v, (1, 0, 2))
+        out  = jnp.matmul(attn, v_t)
+        return jnp.transpose(out, (1, 0, 2))
 
     def _decode(
         self,
-        q: jax.Array,         # (B_real, num_heads, head_dim)
-        k_cache: jax.Array,   # (B_real, ctx_len, num_kv_heads, head_dim)
+        q: jax.Array,
+        k_cache: jax.Array,
         v_cache: jax.Array,
-        seq_lens: jax.Array,  # (B_real,) int32
-    ) -> jax.Array:           # (B_real, num_heads, head_dim)
+        seq_lens: jax.Array,
+    ) -> jax.Array:
         ctx_len = k_cache.shape[1]
         if self.kv_groups > 1:
             k_cache = jnp.repeat(k_cache, self.kv_groups, axis=2)
             v_cache = jnp.repeat(v_cache, self.kv_groups, axis=2)
 
-        q_e   = q[:, :, None, :]                        # (B, H, 1, D)
-        k_t   = jnp.transpose(k_cache, (0, 2, 3, 1))   # (B, H, D, ctx)
-        logits = jnp.matmul(q_e, k_t) * self.scale     # (B, H, 1, ctx)
+        q_e   = q[:, :, None, :]
+        k_t   = jnp.transpose(k_cache, (0, 2, 3, 1))
+        logits = jnp.matmul(q_e, k_t) * self.scale
 
         positions = jnp.arange(ctx_len)[None, None, None, :]
         valid     = positions < seq_lens[:, None, None, None]
         logits    = jnp.where(valid, logits, jnp.finfo(jnp.float32).min)
 
         attn = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
-        v_t  = jnp.transpose(v_cache, (0, 2, 1, 3))    # (B, H, ctx, D)
-        out  = jnp.matmul(attn, v_t)                    # (B, H, 1, D)
-        return out[:, :, 0, :]                           # (B, H, D)
-
-    # ------------------------------------------------------------------
-    # Public forward
-    #
-    # Output shape == input q shape (T_pad or B_pad as leading dim).
-    # Padding rows in the output are zero.
-    # ------------------------------------------------------------------
+        v_t  = jnp.transpose(v_cache, (0, 2, 1, 3))
+        out  = jnp.matmul(attn, v_t)
+        return out[:, :, 0, :]
 
     def __call__(
         self,
-        q: jax.Array,               # (T_pad, num_heads, head_dim)
+        q: jax.Array,
         k: jax.Array,
         v: jax.Array,
         kv_cache: PagedKVCache,
@@ -225,12 +198,11 @@ class Attention(nnx.Module):
         block_table: Optional[jax.Array] = None,
         num_real_tokens: Optional[int] = None,
         num_real_seqs: Optional[int] = None,
-    ) -> jax.Array:                 # same leading dim as q
+    ) -> jax.Array:
         if is_prefill:
             T_pad  = q.shape[0]
             T_real = num_real_tokens if num_real_tokens is not None else T_pad
 
-            # Only write real tokens to avoid cache corruption
             kv_cache.write(
                 self.layer_idx,
                 block_indices[:T_real],
@@ -240,7 +212,6 @@ class Attention(nnx.Module):
             )
             out_real = self._prefill(q[:T_real], k[:T_real], v[:T_real], seq_lens)
 
-            # Pad output back to T_pad so residual adds remain shape-stable
             if T_real < T_pad:
                 pad = jnp.zeros(
                     (T_pad - T_real, self.num_heads, self.head_dim),
@@ -254,7 +225,6 @@ class Attention(nnx.Module):
             B_pad  = q.shape[0]
             B_real = num_real_seqs if num_real_seqs is not None else B_pad
 
-            # Only write the new decode token for real sequences
             kv_cache.write(
                 self.layer_idx,
                 block_indices[:B_real],
@@ -269,7 +239,6 @@ class Attention(nnx.Module):
             )
             out_real = self._decode(q[:B_real], k_ctx, v_ctx, seq_lens[:B_real])
 
-            # Pad output back to B_pad
             if B_real < B_pad:
                 pad = jnp.zeros(
                     (B_pad - B_real, self.num_heads, self.head_dim),
