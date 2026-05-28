@@ -26,29 +26,24 @@ class VocabParallelEmbedding(nnx.Module):
         self.vocab_start_idx = self.num_embeddings_per_partition * tp_rank
         self.vocab_end_idx = self.vocab_start_idx + self.num_embeddings_per_partition
         self.weight = nnx.Param(jnp.zeros((self.num_embeddings_per_partition, embedding_dim)))
-        # _weight_cache bypasses nnx.Param getter instability; always a plain jax.Array
-        object.__setattr__(self, '_weight_cache', None)
 
     def load_weight(self, weight: jax.Array) -> None:
-        arr = jnp.array(weight[self.vocab_start_idx:self.vocab_end_idx, :])
+        # jnp.asarray avoids an unnecessary buffer copy while still
+        # materialising any lazy computation in the slice.
+        arr = jnp.asarray(weight[self.vocab_start_idx:self.vocab_end_idx, :])
         self.weight = nnx.Param(arr)
-        object.__setattr__(self, '_weight_cache', arr)
 
-    def _get_weight(self) -> jax.Array:
-        """Return the weight as a plain jax.Array, always."""
-        cached = object.__getattribute__(self, '_weight_cache')
-        if cached is not None:
-            return cached
-        # Fallback for freshly-constructed (not yet loaded) modules
+    @property
+    def weight_array(self) -> jax.Array:
+        """Return the underlying weight as a plain jax.Array."""
         w = self.weight
-        if hasattr(w, 'get_raw_value'):
-            return jnp.asarray(w.get_raw_value())
+        # nnx.Param exposes the array via .value (all Flax versions)
         if hasattr(w, 'value'):
-            return jnp.asarray(w.value)
+            return w.value
         return jnp.asarray(w)
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        w = self._get_weight()
+        w = self.weight_array
         if self.tp_size == 1:
             return w[x]
         mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
@@ -72,7 +67,6 @@ class ParallelLMHead(nnx.Module):
         self.num_embeddings_per_partition = num_embeddings // tp_size
         self.weight = nnx.Param(jnp.zeros((self.num_embeddings_per_partition, embedding_dim)))
         self._tied_embed: nnx.data = nnx.data(None)
-        object.__setattr__(self, '_weight_cache', None)
 
     def tie_weights(self, embed: VocabParallelEmbedding) -> None:
         assert embed.num_embeddings == self.num_embeddings
@@ -82,34 +76,21 @@ class ParallelLMHead(nnx.Module):
     def load_weight(self, weight: jax.Array) -> None:
         start = self.tp_rank * self.num_embeddings_per_partition
         end = start + self.num_embeddings_per_partition
-        arr = jnp.array(weight[start:end, :])
+        arr = jnp.asarray(weight[start:end, :])
         self.weight = nnx.Param(arr)
-        object.__setattr__(self, '_weight_cache', arr)
-
-    def _get_weight(self) -> jax.Array:
-        """Return the effective weight as a plain jax.Array, always stable."""
-        # Check for tied embedding first
-        tied = self._tied_embed
-        if hasattr(tied, 'value'):
-            tied = tied.value
-        if tied is not None:
-            return tied._get_weight()
-        # Use local cache
-        cached = object.__getattribute__(self, '_weight_cache')
-        if cached is not None:
-            return cached
-        # Fallback
-        w = self.weight
-        if hasattr(w, 'get_raw_value'):
-            return jnp.asarray(w.get_raw_value())
-        if hasattr(w, 'value'):
-            return jnp.asarray(w.value)
-        return jnp.asarray(w)
 
     @property
     def effective_weight(self) -> jax.Array:
         """Return the weight matrix as a plain jax.Array."""
-        return self._get_weight()
+        tied = self._tied_embed
+        if hasattr(tied, 'value'):
+            tied = tied.value
+        if tied is not None:
+            return tied.weight_array
+        w = self.weight
+        if hasattr(w, 'value'):
+            return w.value
+        return jnp.asarray(w)
 
     def __call__(
         self,
@@ -118,4 +99,4 @@ class ParallelLMHead(nnx.Module):
     ) -> jax.Array:
         if last_indices is not None:
             x = x[last_indices]
-        return x @ self._get_weight().T
+        return x @ self.effective_weight.T

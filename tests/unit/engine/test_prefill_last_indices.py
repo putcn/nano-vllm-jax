@@ -18,7 +18,13 @@ from nanovllm_jax.layers.embed_head import ParallelLMHead, VocabParallelEmbeddin
 
 
 def test_lm_head_last_indices_selects_correct_token():
-    """ParallelLMHead with last_indices must return logits for the correct rows."""
+    """ParallelLMHead with last_indices must return logits for the correct rows.
+
+    We verify that head(hidden, last_indices)[i] == head(hidden[[idx]])[0],
+    i.e. the batched gather+project gives the same result as projecting a
+    single-row input.  Both calls go through identical code paths so any
+    difference can only come from wrong row selection.
+    """
     vocab_size = 16
     hidden_size = 8
     num_seqs = 3
@@ -31,18 +37,19 @@ def test_lm_head_last_indices_selects_correct_token():
     hidden = jax.random.normal(jax.random.PRNGKey(1), (T_pad, hidden_size))
     last_indices = jnp.array([2, 5, 11], dtype=jnp.int32)
 
+    # Batched call: head selects rows then projects
     logits_with = head(hidden, last_indices=last_indices)
     assert logits_with.shape == (num_seqs, vocab_size), (
         f"Expected ({num_seqs}, {vocab_size}), got {logits_with.shape}"
     )
 
-    # Both sides use the same effective_weight array so the only difference
-    # can be wrong row selection, not weight round-trip artefacts.
-    ew = head.effective_weight  # plain jax.Array, shape (vocab_size, hidden_size)
+    # Reference: call head on a single-row input — identical code path,
+    # so any mismatch means the wrong row was selected.
     for i, idx in enumerate([2, 5, 11]):
-        expected = hidden[idx] @ ew.T
+        single_row = hidden[idx:idx + 1]          # shape (1, hidden_size)
+        expected = head(single_row)[0]            # shape (vocab_size,)
         assert jnp.allclose(logits_with[i], expected, atol=1e-5), (
-            f"Logit row {i} does not match hidden[{idx}] @ effective_weight.T"
+            f"Logit row {i} does not match single-row head(hidden[{idx}:{idx+1}])[0]"
         )
 
 
