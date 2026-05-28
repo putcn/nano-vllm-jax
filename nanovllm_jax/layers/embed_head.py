@@ -12,11 +12,13 @@ from flax import nnx
 def _param_array(param: nnx.Param) -> jax.Array:
     """Extract a plain jax.Array from an nnx.Param, compatible with all Flax versions.
 
-    Flax >= 0.10 deprecates .raw_value in favour of .get_raw_value().
-    Using .value (the traced Variable accessor) is the safest cross-version path
-    and avoids creating a second copy of the data.
+    Priority:
+      1. get_value()   — Flax >= 0.10 canonical non-deprecated path
+      2. param[...]    — nnx Variable __getitem__ (works on all recent versions)
     """
-    return jnp.asarray(param.value)
+    if hasattr(param, 'get_value'):
+        return jnp.asarray(param.get_value())
+    return jnp.asarray(param[...])
 
 
 class VocabParallelEmbedding(nnx.Module):
@@ -70,16 +72,18 @@ class ParallelLMHead(nnx.Module):
         self.tp_rank = tp_rank
         self.num_embeddings_per_partition = num_embeddings // tp_size
         self.weight = nnx.Param(jnp.zeros((self.num_embeddings_per_partition, embedding_dim)))
-        # Optional reference to a tied VocabParallelEmbedding.
-        # Stored as a plain Python attribute (not nnx.Variable / nnx.data) so
-        # that nnx.jit does not treat it as a trainable parameter while still
-        # keeping the live reference across JIT retracing.
-        self._tied_embed: Optional[VocabParallelEmbedding] = None
+        # nnx.data() wraps a non-Variable payload so Flax's Pytree machinery
+        # accepts it as a data attribute (not a trainable param, not static).
+        # Must be initialised as nnx.data(None) so the slot type is consistent
+        # with the nnx.data(embed) assigned in tie_weights().
+        self._tied_embed = nnx.data(None)
 
     def tie_weights(self, embed: VocabParallelEmbedding) -> None:
         assert embed.num_embeddings == self.num_embeddings
         assert embed.embedding_dim == self.embedding_dim
-        self._tied_embed = embed
+        # Must wrap in nnx.data() — Flax NNX Pytree rejects assigning a bare
+        # Module subclass to a slot that was initialised as nnx.data(None).
+        self._tied_embed = nnx.data(embed)
 
     def load_weight(self, weight: jax.Array) -> None:
         start = self.tp_rank * self.num_embeddings_per_partition
@@ -93,10 +97,15 @@ class ParallelLMHead(nnx.Module):
 
         Uses the tied embedding's weight when tie_word_embeddings=True,
         otherwise uses the LM head's own weight.  Both paths go through
-        _param_array() to guarantee a single consistent allocation.
+        _param_array() to guarantee a single consistent allocation and
+        avoid deprecated Flax accessor warnings.
         """
-        if self._tied_embed is not None:
-            return _param_array(self._tied_embed.weight)
+        # Unwrap nnx.data wrapper to get the actual VocabParallelEmbedding
+        tied = self._tied_embed
+        if hasattr(tied, 'value'):
+            tied = tied.value
+        if tied is not None:
+            return _param_array(tied.weight)
         return _param_array(self.weight)
 
     def __call__(
