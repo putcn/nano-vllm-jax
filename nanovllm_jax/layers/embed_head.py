@@ -1,19 +1,23 @@
 """Token embedding and LM head (JAX port of nanovllm/layers/embed_head.py).
 
-Status: ✅ Fixed (weight tying: nnx.data slot + get_raw_value() unwrap)
+Status: ✅ Fixed (weight tying via object.__setattr__ bypass)
 
-Weight tying rules for Flax NNX
---------------------------------
-1. The slot must be initialised as ``nnx.data(None)`` in ``__init__`` so
-   Flax marks it as a *data* attribute (not static).  Assigning a bare
-   Module to a slot initialised as ``None`` (static) raises ValueError.
-2. ``tie_weights`` wraps the embed module with ``nnx.data(embed)`` to keep
-   the slot type consistent with the initial ``nnx.data(None)``.
-3. ``effective_weight`` unwraps via ``get_raw_value()`` — the canonical
-   non-deprecated accessor (as flagged by the DeprecationWarning for
-   ``.raw_value``).  The old ``.value`` accessor silently returned ``None``
-   in current Flax, causing lm_head to fall back to zero-initialised
-   weights and produce garbage predictions for Qwen3.
+Weight tying design
+-------------------
+Flax NNX's Pytree machinery enforces strict type consistency on Module
+attributes: a slot initialised as ``None`` (static) cannot later be assigned
+a Module instance (data).  The ``nnx.data()`` wrapper is the official fix,
+but unwrapping it reliably across Flax versions is fragile — ``.value``,
+``.raw_value``, and ``.get_raw_value()`` all have deprecation or availability
+issues depending on the exact Flax release.
+
+Instead we bypass the NNX Pytree type system entirely by storing the tied
+embedding reference with ``object.__setattr__``.  This is a well-known Python
+pattern for injecting attributes that should be invisible to a class's
+``__setattr__`` override.  NNX's Pytree traversal only sees attributes that
+were set through its own ``__setattr__``, so ``_tied_embed_ref`` is simply
+skipped during tracing — which is exactly what we want: the reference is a
+pure Python pointer, not a JAX parameter.
 """
 from __future__ import annotations
 from typing import Optional
@@ -85,17 +89,18 @@ class ParallelLMHead(nnx.Module):
         self.tp_rank = tp_rank
         self.num_embeddings_per_partition = num_embeddings // tp_size
         self.weight = nnx.Param(jnp.zeros((self.num_embeddings_per_partition, embedding_dim)))
-        # Must be nnx.data(None) — not bare None — so Flax marks this slot as
-        # a *data* attribute.  Assigning nnx.data(embed) later is only allowed
-        # when the initial value is also wrapped in nnx.data().
-        self._tied_embed = nnx.data(None)
+        # Initialise the bypass slot via object.__setattr__ so NNX Pytree
+        # machinery never sees it.  Must be set here (not skipped) so that
+        # object.__getattribute__ always finds it even before tie_weights().
+        object.__setattr__(self, '_tied_embed_ref', None)
 
     def tie_weights(self, embed: VocabParallelEmbedding) -> None:
         assert embed.num_embeddings == self.num_embeddings
         assert embed.embedding_dim == self.embedding_dim
-        # Keep slot type consistent: must wrap with nnx.data() to match the
-        # nnx.data(None) established in __init__.
-        self._tied_embed = nnx.data(embed)
+        # Bypass NNX __setattr__ to store a plain Python reference.
+        # NNX Pytree traversal only visits attributes set via its own
+        # __setattr__, so this reference is invisible to JAX tracing.
+        object.__setattr__(self, '_tied_embed_ref', embed)
 
     def load_weight(self, weight: jax.Array) -> None:
         start = self.tp_rank * self.num_embeddings_per_partition
@@ -107,18 +112,12 @@ class ParallelLMHead(nnx.Module):
     def effective_weight(self) -> jax.Array:
         """Return the weight matrix as a plain jax.Array.
 
-        Uses the tied embedding's weight when tie_word_embeddings=True.
-        Unwraps nnx.data via get_raw_value() — the canonical non-deprecated
-        API (replaces the broken .value accessor that silently returned None).
+        Reads the tied VocabParallelEmbedding's weight when tie_word_embeddings
+        is True, otherwise falls back to this module's own weight parameter.
+        The tied embed reference is stored via object.__setattr__ to bypass
+        NNX Pytree type enforcement.
         """
-        tied_wrapper = self._tied_embed
-        # get_raw_value() is the non-deprecated replacement for .raw_value
-        # and .value, as shown in the DeprecationWarning emitted at runtime.
-        if hasattr(tied_wrapper, 'get_raw_value'):
-            embed = tied_wrapper.get_raw_value()
-        else:
-            # Fallback for older Flax versions that use .raw_value
-            embed = getattr(tied_wrapper, 'raw_value', None)
+        embed = object.__getattribute__(self, '_tied_embed_ref')
         if embed is not None:
             return embed.weight_array
         return _param_array(self.weight)
