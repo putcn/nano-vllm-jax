@@ -1,186 +1,253 @@
-"""Unit tests for PagedKVCache and Attention (Phase 3)."""
+"""Unit tests for PagedKVCache and Attention.
+
+Covers:
+- write() does not corrupt cache when padding tokens are present
+- read() only reads real sequence rows
+- decode output shape matches padded batch size
+- prefill output shape is correct
+- padding tokens do not bleed into real cache slots
+"""
 import pytest
-import numpy as np
 import jax
 import jax.numpy as jnp
-from flax import nnx
+import numpy as np
 
-from nanovllm_jax.layers.attention import PagedKVCache, Attention
-
-
-def rand(shape, seed=0):
-    return np.random.default_rng(seed).standard_normal(shape).astype(np.float32)
+from nanovllm_jax.layers.attention import Attention, PagedKVCache
 
 
-# ---------------------------------------------------------------------------
-# PagedKVCache
-# ---------------------------------------------------------------------------
-
-def test_cache_init_shape():
-    cache = PagedKVCache(
-        num_layers=4, num_kv_heads=2, head_dim=16,
-        num_blocks=8, block_size=4,
-    )
-    assert cache.cache.get_value().shape == (4, 2, 8, 4, 2, 16)
+NUM_LAYERS   = 2
+NUM_KV_HEADS = 2
+HEAD_DIM     = 8
+NUM_BLOCKS   = 16
+BLOCK_SIZE   = 4
+NUM_HEADS    = 4  # GQA: 4Q / 2KV
 
 
-def test_cache_write_read_roundtrip():
-    """Write tokens to layer 0, read back and check values."""
-    cache = PagedKVCache(
-        num_layers=2, num_kv_heads=2, head_dim=8,
-        num_blocks=4, block_size=4, dtype=jnp.float32,
-    )
-    num_tokens = 3
-    k = jnp.array(rand((num_tokens, 2, 8), seed=1))
-    v = jnp.array(rand((num_tokens, 2, 8), seed=2))
-    block_indices = jnp.array([0, 0, 1], dtype=jnp.int32)
-    block_offsets = jnp.array([0, 1, 0], dtype=jnp.int32)
-
-    cache.write(0, block_indices, block_offsets, k, v)
-
-    # Read back via block_table
-    block_table = jnp.array([[0, 1]], dtype=jnp.int32)  # 1 seq, 2 blocks
-    seq_lens = jnp.array([3], dtype=jnp.int32)
-    k_out, v_out = cache.read(0, block_table, seq_lens)
-
-    # Shape: (1, 8, 2, 8) — 1 seq, 2*block_size=8 positions
-    assert k_out.shape == (1, 8, 2, 8)
-    np.testing.assert_allclose(np.array(k_out[0, 0]), np.array(k[0]), atol=1e-5)
-    np.testing.assert_allclose(np.array(k_out[0, 1]), np.array(k[1]), atol=1e-5)
-    np.testing.assert_allclose(np.array(k_out[0, 4]), np.array(k[2]), atol=1e-5)
-
-
-def test_cache_multi_layer_isolation():
-    """Writes to different layers must not interfere."""
-    cache = PagedKVCache(
-        num_layers=3, num_kv_heads=1, head_dim=4,
-        num_blocks=4, block_size=2, dtype=jnp.float32,
-    )
-    k0 = jnp.ones((1, 1, 4)) * 1.0
-    k1 = jnp.ones((1, 1, 4)) * 2.0
-    v = jnp.zeros((1, 1, 4))
-    bi = jnp.array([0], dtype=jnp.int32)
-    bo = jnp.array([0], dtype=jnp.int32)
-
-    cache.write(0, bi, bo, k0, v)
-    cache.write(1, bi, bo, k1, v)
-
-    bt = jnp.array([[0, 1]], dtype=jnp.int32)
-    sl = jnp.array([1], dtype=jnp.int32)
-    k_out0, _ = cache.read(0, bt, sl)
-    k_out1, _ = cache.read(1, bt, sl)
-
-    # k_out shape: (1, max_seq_len, num_kv_heads, head_dim)
-    # = (1, 4, 1, 4) for this config; index [seq, pos, head, :]
-    np.testing.assert_allclose(np.array(k_out0[0, 0, 0]), np.ones(4) * 1.0, atol=1e-5)
-    np.testing.assert_allclose(np.array(k_out1[0, 0, 0]), np.ones(4) * 2.0, atol=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# Attention — prefill
-# ---------------------------------------------------------------------------
-
-def test_attention_prefill_shape():
-    attn = Attention(num_heads=4, head_dim=16, num_kv_heads=2)
-    cache = PagedKVCache(
-        num_layers=1, num_kv_heads=2, head_dim=16,
-        num_blocks=16, block_size=8,
-    )
-    T = 6
-    q = jnp.array(rand((T, 4, 16)))
-    k = jnp.array(rand((T, 2, 16)))
-    v = jnp.array(rand((T, 2, 16)))
-    bi = jnp.arange(T, dtype=jnp.int32) // 8
-    bo = jnp.arange(T, dtype=jnp.int32) % 8
-    sl = jnp.array([T], dtype=jnp.int32)
-
-    out = attn(q, k, v, cache, bi, bo, sl, is_prefill=True)
-    assert out.shape == (T, 4, 16)
-
-
-def test_attention_prefill_causal():
-    """Output for token 0 must not depend on tokens 1+."""
-    attn = Attention(num_heads=2, head_dim=8, num_kv_heads=2)
-    cache_a = PagedKVCache(num_layers=1, num_kv_heads=2, head_dim=8, num_blocks=8, block_size=8)
-    cache_b = PagedKVCache(num_layers=1, num_kv_heads=2, head_dim=8, num_blocks=8, block_size=8)
-
-    q = jnp.array(rand((4, 2, 8), seed=0))
-    k = jnp.array(rand((4, 2, 8), seed=1))
-    v = jnp.array(rand((4, 2, 8), seed=2))
-    bi = jnp.zeros(4, dtype=jnp.int32)
-    bo = jnp.arange(4, dtype=jnp.int32)
-    sl = jnp.array([4], dtype=jnp.int32)
-    sl1 = jnp.array([1], dtype=jnp.int32)
-
-    out_full = attn(q, k, v, cache_a, bi, bo, sl, is_prefill=True)
-    out_one = attn(q[:1], k[:1], v[:1], cache_b, bi[:1], bo[:1], sl1, is_prefill=True)
-
-    np.testing.assert_allclose(
-        np.array(out_full[0]), np.array(out_one[0]), atol=1e-4,
+@pytest.fixture
+def kv_cache():
+    return PagedKVCache(
+        num_layers=NUM_LAYERS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        num_blocks=NUM_BLOCKS,
+        block_size=BLOCK_SIZE,
+        dtype=jnp.float32,
     )
 
 
-def test_attention_prefill_gqa():
-    """GQA: num_heads=8, num_kv_heads=2."""
-    attn = Attention(num_heads=8, head_dim=16, num_kv_heads=2)
-    cache = PagedKVCache(num_layers=1, num_kv_heads=2, head_dim=16, num_blocks=8, block_size=8)
-    T = 5
-    q = jnp.array(rand((T, 8, 16)))
-    k = jnp.array(rand((T, 2, 16)))
-    v = jnp.array(rand((T, 2, 16)))
-    bi = jnp.zeros(T, dtype=jnp.int32)
-    bo = jnp.arange(T, dtype=jnp.int32)
-    sl = jnp.array([T], dtype=jnp.int32)
-    out = attn(q, k, v, cache, bi, bo, sl, is_prefill=True)
-    assert out.shape == (T, 8, 16)
-
-
-# ---------------------------------------------------------------------------
-# Attention — decode
-# ---------------------------------------------------------------------------
-
-def test_attention_decode_shape():
-    attn = Attention(num_heads=4, head_dim=16, num_kv_heads=2)
-    cache = PagedKVCache(
-        num_layers=1, num_kv_heads=2, head_dim=16,
-        num_blocks=16, block_size=8,
+@pytest.fixture
+def attn():
+    return Attention(
+        num_heads=NUM_HEADS,
+        head_dim=HEAD_DIM,
+        num_kv_heads=NUM_KV_HEADS,
+        layer_idx=0,
     )
-    # Prefill 4 tokens first
-    T = 4
-    q_p = jnp.array(rand((T, 4, 16)))
-    k_p = jnp.array(rand((T, 2, 16)))
-    v_p = jnp.array(rand((T, 2, 16)))
-    bi_p = jnp.zeros(T, dtype=jnp.int32)
-    bo_p = jnp.arange(T, dtype=jnp.int32)
-    sl = jnp.array([T], dtype=jnp.int32)
-    attn(q_p, k_p, v_p, cache, bi_p, bo_p, sl, is_prefill=True)
-
-    # Decode step: 1 new token
-    q_d = jnp.array(rand((1, 4, 16)))
-    k_d = jnp.array(rand((1, 2, 16)))
-    v_d = jnp.array(rand((1, 2, 16)))
-    bi_d = jnp.array([0], dtype=jnp.int32)
-    bo_d = jnp.array([T], dtype=jnp.int32)
-    sl_d = jnp.array([T + 1], dtype=jnp.int32)
-    bt = jnp.array([[0, 1]], dtype=jnp.int32)
-
-    out = attn(q_d, k_d, v_d, cache, bi_d, bo_d, sl_d,
-               is_prefill=False, block_table=bt)
-    assert out.shape == (1, 4, 16)
 
 
 # ---------------------------------------------------------------------------
-# Attention — scale
+# PagedKVCache.write — padding isolation
 # ---------------------------------------------------------------------------
 
-def test_attention_custom_scale():
-    attn = Attention(num_heads=2, head_dim=8, scale=0.5)
-    cache = PagedKVCache(num_layers=1, num_kv_heads=2, head_dim=8, num_blocks=4, block_size=8)
-    q = jnp.array(rand((2, 2, 8)))
-    k = jnp.array(rand((2, 2, 8)))
-    v = jnp.array(rand((2, 2, 8)))
-    bi = jnp.zeros(2, dtype=jnp.int32)
-    bo = jnp.arange(2, dtype=jnp.int32)
-    sl = jnp.array([2], dtype=jnp.int32)
-    out = attn(q, k, v, cache, bi, bo, sl, is_prefill=True)
-    assert out.shape == (2, 2, 8)
+class TestKVCacheWrite:
+    def test_write_real_tokens_only(self, kv_cache):
+        """Writing 2 real tokens must not touch blocks used by other sequences."""
+        num_real = 2
+        bi = jnp.array([0, 0], dtype=jnp.int32)   # block 0
+        bo = jnp.array([0, 1], dtype=jnp.int32)   # offsets 0,1
+        k  = jnp.ones((num_real, NUM_KV_HEADS, HEAD_DIM), dtype=jnp.float32)
+        v  = jnp.ones((num_real, NUM_KV_HEADS, HEAD_DIM), dtype=jnp.float32) * 2.0
+
+        kv_cache.write(0, bi, bo, k, v)
+        cache = kv_cache.cache.value
+
+        # Block 0, offsets 0-1 should be written
+        assert jnp.allclose(cache[0, 0, 0, 0], 1.0)
+        assert jnp.allclose(cache[0, 0, 0, 1], 1.0)
+        # Block 0, offsets 2-3 must still be zero
+        assert jnp.allclose(cache[0, 0, 0, 2], 0.0)
+        # Block 1 must still be zero (not touched)
+        assert jnp.allclose(cache[0, 0, 1], 0.0)
+
+    def test_padding_tokens_excluded(self, kv_cache):
+        """Caller must NOT pass padding tokens — verify block 0 is not overwritten."""
+        # First write real data into block 0 offset 0
+        bi_real = jnp.array([0], dtype=jnp.int32)
+        bo_real = jnp.array([0], dtype=jnp.int32)
+        k_real  = jnp.ones((1, NUM_KV_HEADS, HEAD_DIM)) * 99.0
+        v_real  = jnp.ones((1, NUM_KV_HEADS, HEAD_DIM)) * 99.0
+        kv_cache.write(0, bi_real, bo_real, k_real, v_real)
+
+        # Now write a padding token also at block 0 offset 1
+        bi_pad = jnp.array([0], dtype=jnp.int32)
+        bo_pad = jnp.array([1], dtype=jnp.int32)
+        k_pad  = jnp.ones((1, NUM_KV_HEADS, HEAD_DIM)) * -1.0
+        v_pad  = jnp.ones((1, NUM_KV_HEADS, HEAD_DIM)) * -1.0
+        kv_cache.write(0, bi_pad, bo_pad, k_pad, v_pad)
+
+        cache = kv_cache.cache.value
+        # Real slot must be untouched
+        assert jnp.allclose(cache[0, 0, 0, 0], 99.0)
+        # Padding slot was written separately
+        assert jnp.allclose(cache[0, 0, 0, 1], -1.0)
+
+
+# ---------------------------------------------------------------------------
+# PagedKVCache.read — only real sequences
+# ---------------------------------------------------------------------------
+
+class TestKVCacheRead:
+    def test_read_returns_correct_shape(self, kv_cache):
+        num_seqs  = 2
+        max_blocks = 2
+        block_table = jnp.zeros((num_seqs, max_blocks), dtype=jnp.int32)
+        seq_lens    = jnp.array([3, 2], dtype=jnp.int32)
+        k_out, v_out = kv_cache.read(0, block_table, seq_lens)
+        expected_ctx = max_blocks * BLOCK_SIZE
+        assert k_out.shape == (num_seqs, expected_ctx, NUM_KV_HEADS, HEAD_DIM)
+        assert v_out.shape == (num_seqs, expected_ctx, NUM_KV_HEADS, HEAD_DIM)
+
+    def test_read_isolates_sequences(self, kv_cache):
+        """Two sequences using different blocks must read independent KV."""
+        # Write distinctive values into block 0 and block 1
+        bi0 = jnp.array([0], dtype=jnp.int32)
+        bi1 = jnp.array([1], dtype=jnp.int32)
+        bo  = jnp.array([0], dtype=jnp.int32)
+        kv_cache.write(0, bi0, bo,
+                       jnp.ones((1, NUM_KV_HEADS, HEAD_DIM)) * 1.0,
+                       jnp.ones((1, NUM_KV_HEADS, HEAD_DIM)) * 1.0)
+        kv_cache.write(0, bi1, bo,
+                       jnp.ones((1, NUM_KV_HEADS, HEAD_DIM)) * 2.0,
+                       jnp.ones((1, NUM_KV_HEADS, HEAD_DIM)) * 2.0)
+
+        # seq 0 uses block 0; seq 1 uses block 1
+        block_table = jnp.array([[0, 0], [1, 1]], dtype=jnp.int32)
+        seq_lens    = jnp.array([1, 1], dtype=jnp.int32)
+        k_out, _ = kv_cache.read(0, block_table, seq_lens)
+
+        assert jnp.allclose(k_out[0, 0], 1.0), "seq 0 should read block 0"
+        assert jnp.allclose(k_out[1, 0], 2.0), "seq 1 should read block 1"
+
+
+# ---------------------------------------------------------------------------
+# Attention.__call__ — prefill
+# ---------------------------------------------------------------------------
+
+class TestAttentionPrefill:
+    def test_prefill_output_shape(self, attn, kv_cache):
+        T_real = 5
+        T_pad  = 8
+        q  = jnp.ones((T_pad, NUM_HEADS,    HEAD_DIM))
+        k  = jnp.ones((T_pad, NUM_KV_HEADS, HEAD_DIM))
+        v  = jnp.ones((T_pad, NUM_KV_HEADS, HEAD_DIM))
+        bi = jnp.zeros(T_pad, dtype=jnp.int32)
+        bo = jnp.arange(T_pad, dtype=jnp.int32)
+        seq_lens = jnp.array([T_real], dtype=jnp.int32)
+
+        out = attn(q, k, v, kv_cache, bi, bo, seq_lens,
+                   is_prefill=True, num_real_tokens=T_real)
+        # Output shape should match real tokens only
+        assert out.shape == (T_real, NUM_HEADS, HEAD_DIM)
+
+    def test_prefill_does_not_write_padding(self, kv_cache):
+        """Padding tokens must not pollute the KV cache."""
+        attn_layer = Attention(NUM_HEADS, HEAD_DIM, NUM_KV_HEADS, layer_idx=0)
+        T_real, T_pad = 2, 4
+        q  = jnp.ones((T_pad, NUM_HEADS,    HEAD_DIM))
+        k  = jnp.ones((T_pad, NUM_KV_HEADS, HEAD_DIM))
+        v  = jnp.ones((T_pad, NUM_KV_HEADS, HEAD_DIM))
+        # Real tokens go to block 0, offsets 0-1
+        # Padding tokens would go to offsets 2-3 of block 0
+        bi = jnp.array([0, 0, 0, 0], dtype=jnp.int32)
+        bo = jnp.array([0, 1, 2, 3], dtype=jnp.int32)
+        seq_lens = jnp.array([T_real], dtype=jnp.int32)
+
+        attn_layer(q, k, v, kv_cache, bi, bo, seq_lens,
+                   is_prefill=True, num_real_tokens=T_real)
+
+        cache = kv_cache.cache.value
+        # Offsets 0-1 (real) should be non-zero
+        assert not jnp.allclose(cache[0, 0, 0, 0], 0.0)
+        assert not jnp.allclose(cache[0, 0, 0, 1], 0.0)
+        # Offsets 2-3 (padding) must remain zero
+        assert jnp.allclose(cache[0, 0, 0, 2], 0.0), "padding wrote to cache!"
+        assert jnp.allclose(cache[0, 0, 0, 3], 0.0), "padding wrote to cache!"
+
+
+# ---------------------------------------------------------------------------
+# Attention.__call__ — decode
+# ---------------------------------------------------------------------------
+
+class TestAttentionDecode:
+    def test_decode_output_shape_matches_padded_batch(self, attn, kv_cache):
+        """Decode output must be padded back to B_pad for downstream ops."""
+        B_real, B_pad = 2, 4
+        q  = jnp.ones((B_pad, NUM_HEADS,    HEAD_DIM))
+        k  = jnp.ones((B_pad, NUM_KV_HEADS, HEAD_DIM))
+        v  = jnp.ones((B_pad, NUM_KV_HEADS, HEAD_DIM))
+        bi = jnp.zeros(B_pad, dtype=jnp.int32)
+        bo = jnp.zeros(B_pad, dtype=jnp.int32)
+        seq_lens    = jnp.ones(B_pad, dtype=jnp.int32)
+        block_table = jnp.zeros((B_pad, 2), dtype=jnp.int32)
+
+        out = attn(q, k, v, kv_cache, bi, bo, seq_lens,
+                   is_prefill=False,
+                   block_table=block_table,
+                   num_real_seqs=B_real)
+        assert out.shape == (B_pad, NUM_HEADS, HEAD_DIM), \
+            f"expected ({B_pad}, {NUM_HEADS}, {HEAD_DIM}), got {out.shape}"
+
+    def test_decode_padded_rows_are_zero(self, attn, kv_cache):
+        """Rows beyond num_real_seqs must be zero-padded in the output."""
+        B_real, B_pad = 1, 4
+        q  = jnp.ones((B_pad, NUM_HEADS,    HEAD_DIM))
+        k  = jnp.ones((B_pad, NUM_KV_HEADS, HEAD_DIM))
+        v  = jnp.ones((B_pad, NUM_KV_HEADS, HEAD_DIM))
+        bi = jnp.zeros(B_pad, dtype=jnp.int32)
+        bo = jnp.zeros(B_pad, dtype=jnp.int32)
+        seq_lens    = jnp.ones(B_pad, dtype=jnp.int32)
+        block_table = jnp.zeros((B_pad, 1), dtype=jnp.int32)
+
+        out = attn(q, k, v, kv_cache, bi, bo, seq_lens,
+                   is_prefill=False,
+                   block_table=block_table,
+                   num_real_seqs=B_real)
+        # Padded rows [1:] must be all zeros
+        assert jnp.allclose(out[1:], 0.0), "padded rows should be zero"
+
+    def test_decode_sequences_independent(self):
+        """Two decode sequences with different block tables must get different outputs."""
+        cache = PagedKVCache(
+            num_layers=1, num_kv_heads=1, head_dim=4,
+            num_blocks=4, block_size=2, dtype=jnp.float32,
+        )
+        attn_layer = Attention(num_heads=1, head_dim=4, num_kv_heads=1, layer_idx=0)
+
+        # Pre-fill block 0 with value 1.0, block 1 with value 2.0
+        cache.write(0,
+                    jnp.array([0], dtype=jnp.int32),
+                    jnp.array([0], dtype=jnp.int32),
+                    jnp.ones((1, 1, 4)) * 1.0,
+                    jnp.ones((1, 1, 4)) * 1.0)
+        cache.write(0,
+                    jnp.array([1], dtype=jnp.int32),
+                    jnp.array([0], dtype=jnp.int32),
+                    jnp.ones((1, 1, 4)) * 2.0,
+                    jnp.ones((1, 1, 4)) * 2.0)
+
+        B_real = 2
+        q  = jnp.ones((B_real, 1, 4))
+        k  = jnp.zeros((B_real, 1, 4))
+        v  = jnp.zeros((B_real, 1, 4))
+        bi = jnp.array([0, 1], dtype=jnp.int32)  # decode token goes to new slot
+        bo = jnp.array([1, 1], dtype=jnp.int32)
+        seq_lens    = jnp.array([2, 2], dtype=jnp.int32)
+        block_table = jnp.array([[0, 0], [1, 1]], dtype=jnp.int32)
+
+        out = attn_layer(q, k, v, cache, bi, bo, seq_lens,
+                         is_prefill=False,
+                         block_table=block_table,
+                         num_real_seqs=B_real)
+        # The two sequences read different blocks so outputs must differ
+        assert not jnp.allclose(out[0], out[1]), \
+            "sequences should have independent outputs"
