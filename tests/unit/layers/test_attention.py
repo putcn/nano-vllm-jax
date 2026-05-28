@@ -70,8 +70,10 @@ def test_cache_multi_layer_isolation():
     k_out0, _ = cache.read(0, bt, sl)
     k_out1, _ = cache.read(1, bt, sl)
 
-    np.testing.assert_allclose(np.array(k_out0[0, 0]), np.ones(4) * 1.0, atol=1e-5)
-    np.testing.assert_allclose(np.array(k_out1[0, 0]), np.ones(4) * 2.0, atol=1e-5)
+    # k_out shape: (1, max_seq_len, num_kv_heads, head_dim)
+    # = (1, 4, 1, 4) for this config; index [seq, pos, head, :]
+    np.testing.assert_allclose(np.array(k_out0[0, 0, 0]), np.ones(4) * 1.0, atol=1e-5)
+    np.testing.assert_allclose(np.array(k_out1[0, 0, 0]), np.ones(4) * 2.0, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
