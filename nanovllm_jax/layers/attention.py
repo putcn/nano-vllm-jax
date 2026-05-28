@@ -1,6 +1,6 @@
 """Paged KV Cache and Attention (JAX port of nanovllm/layers/attention.py).
 
-Status: ✅ Fixed (nnx.jit persistence, shape contracts)
+Status: ✅ Fixed (nnx.jit persistence, shape contracts, cross-seq causal mask)
 
 Design notes vs PyTorch original:
 - PagedKVCache uses jax.lax.dynamic_update_slice / dynamic_slice instead of
@@ -21,6 +21,16 @@ nx.jit extracts nnx.Variable state, threads it through XLA as mutable
 arrays, and writes updates back to the Python objects after every call.
 PagedKVCache.write() itself does not need to change.
 
+Causal mask for batched prefill
+--------------------------------
+When multiple sequences are packed into a single flat token buffer, a naive
+(T, T) lower-triangular mask is WRONG: it allows seq[i+1]'s tokens to
+attend to seq[i]'s tokens across the sequence boundary.
+
+Fix: build a per-token "sequence id" array from seq_lens, then mask out
+any (query, key) pair where seq_id[q] != seq_id[k] OR pos[k] > pos[q].
+This is equivalent to a block-diagonal causal mask.
+
 Shape contract
 --------------
 __call__ always returns the same leading dimension as the input q:
@@ -39,6 +49,36 @@ def _get_variable(v):
     if hasattr(v, 'get_value'):
         return v.get_value()
     return v.value  # fallback for older Flax
+
+
+def _make_batched_causal_mask(seq_lens: jax.Array, T: int) -> jax.Array:
+    """Build a (T, T) boolean mask for packed multi-sequence prefill.
+
+    Entry [i, j] is True iff:
+      - token i and token j belong to the same sequence, AND
+      - j <= i  (causal: key position <= query position)
+
+    This prevents cross-sequence attention when multiple prompts are
+    packed into a single flat token buffer.
+
+    Args:
+        seq_lens: (num_seqs,) int32 — real length of each sequence.
+        T:        total number of real tokens (== sum(seq_lens)).
+
+    Returns:
+        mask: (T, T) bool array.
+    """
+    # Build a per-token sequence-id array, e.g. [0,0,0,1,1,2,2,2,2]
+    num_seqs = seq_lens.shape[0]
+    seq_id = jnp.repeat(jnp.arange(num_seqs, dtype=jnp.int32), seq_lens, total_repeat_length=T)
+
+    # same_seq[i, j] = (seq_id[i] == seq_id[j])
+    same_seq = seq_id[:, None] == seq_id[None, :]  # (T, T)
+
+    # causal[i, j] = (j <= i)
+    causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
+
+    return same_seq & causal
 
 
 # ---------------------------------------------------------------------------
@@ -143,22 +183,28 @@ class Attention(nnx.Module):
         v: jax.Array,
         seq_lens: jax.Array,
     ) -> jax.Array:
+        """Prefill attention with correct per-sequence causal masking.
+
+        Uses a block-diagonal causal mask so tokens in different sequences
+        cannot attend to each other, even when packed into a single flat buffer.
+        """
         T = q.shape[0]
         if self.kv_groups > 1:
             k = jnp.repeat(k, self.kv_groups, axis=1)
             v = jnp.repeat(v, self.kv_groups, axis=1)
 
-        q_t = jnp.transpose(q, (1, 0, 2))
-        k_t = jnp.transpose(k, (1, 2, 0))
-        logits = jnp.matmul(q_t, k_t) * self.scale
+        q_t = jnp.transpose(q, (1, 0, 2))  # (H, T, D)
+        k_t = jnp.transpose(k, (1, 2, 0))  # (H, D, T)
+        logits = jnp.matmul(q_t, k_t) * self.scale  # (H, T, T)
 
-        mask   = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
+        # Block-diagonal causal mask: prevents cross-sequence attention.
+        mask = _make_batched_causal_mask(seq_lens, T)  # (T, T) bool
         logits = jnp.where(mask[None, :, :], logits, jnp.finfo(jnp.float32).min)
 
         attn = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
-        v_t  = jnp.transpose(v, (1, 0, 2))
-        out  = jnp.matmul(attn, v_t)
-        return jnp.transpose(out, (1, 0, 2))
+        v_t  = jnp.transpose(v, (1, 0, 2))  # (H, T, D)
+        out  = jnp.matmul(attn, v_t)         # (H, T, D)
+        return jnp.transpose(out, (1, 0, 2)) # (T, H, D)
 
     def _decode(
         self,
@@ -172,18 +218,18 @@ class Attention(nnx.Module):
             k_cache = jnp.repeat(k_cache, self.kv_groups, axis=2)
             v_cache = jnp.repeat(v_cache, self.kv_groups, axis=2)
 
-        q_e   = q[:, :, None, :]
-        k_t   = jnp.transpose(k_cache, (0, 2, 3, 1))
-        logits = jnp.matmul(q_e, k_t) * self.scale
+        q_e   = q[:, :, None, :]                          # (B, H, 1, D)
+        k_t   = jnp.transpose(k_cache, (0, 2, 3, 1))     # (B, H, D, ctx)
+        logits = jnp.matmul(q_e, k_t) * self.scale       # (B, H, 1, ctx)
 
         positions = jnp.arange(ctx_len)[None, None, None, :]
         valid     = positions < seq_lens[:, None, None, None]
         logits    = jnp.where(valid, logits, jnp.finfo(jnp.float32).min)
 
         attn = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
-        v_t  = jnp.transpose(v_cache, (0, 2, 1, 3))
-        out  = jnp.matmul(attn, v_t)
-        return out[:, :, 0, :]
+        v_t  = jnp.transpose(v_cache, (0, 2, 1, 3))      # (B, H, ctx, D)
+        out  = jnp.matmul(attn, v_t)                      # (B, H, 1, D)
+        return out[:, :, 0, :]                             # (B, H, D)
 
     def __call__(
         self,
