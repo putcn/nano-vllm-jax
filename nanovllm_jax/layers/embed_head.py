@@ -3,12 +3,9 @@
 Status: ✅ Done (Phase 2.2)
 
 Design notes vs PyTorch original:
-- VocabParallelEmbedding: tp sharding via vocab range masking (same logic,
-  but jnp.where instead of torch masked ops).
-- ParallelLMHead: inherits embedding weight (supports weight tying).
-  The 'last token selection for prefill' is handled by the model runner
-  in JAX (context object not ported yet); __call__ accepts an optional
-  last_indices argument instead.
+- VocabParallelEmbedding: tp sharding via vocab range masking.
+- ParallelLMHead: supports weight tying via tie_weights().
+  _tied_embed is stored as nnx.data() to satisfy Flax NNX pytree rules.
 - All ops are jit-compilable.
 """
 from __future__ import annotations
@@ -59,8 +56,7 @@ class VocabParallelEmbedding(nnx.Module):
         """
         start = self.vocab_start_idx
         end = self.vocab_end_idx
-        shard = weight[start:end, :]
-        self.weight = nnx.Param(jnp.array(shard))
+        self.weight = nnx.Param(jnp.array(weight[start:end, :]))
 
     def __call__(self, x: jax.Array) -> jax.Array:
         """Token id lookup.
@@ -72,7 +68,7 @@ class VocabParallelEmbedding(nnx.Module):
         """
         if self.tp_size == 1:
             return self.weight.value[x]
-        # TP > 1: mask tokens outside this rank's vocab range
+        # TP > 1: mask tokens outside this rank’s vocab range
         mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
         local_x = jnp.where(mask, x - self.vocab_start_idx, 0)
         y = self.weight.value[local_x]
@@ -84,8 +80,9 @@ class VocabParallelEmbedding(nnx.Module):
 class ParallelLMHead(nnx.Module):
     """Language model head: projects hidden states to vocab logits.
 
-    Shares weight with VocabParallelEmbedding when weight tying is used
-    (pass embed_module to tie_weights).
+    Supports weight tying with VocabParallelEmbedding via tie_weights().
+    _tied_embed is wrapped with nnx.data() so Flax NNX does not treat it
+    as a static pytree attribute.
 
     Args:
         num_embeddings: full vocabulary size
@@ -107,11 +104,12 @@ class ParallelLMHead(nnx.Module):
         self.tp_rank = tp_rank
         self.num_embeddings_per_partition = num_embeddings // tp_size
 
-        # Own weight (used when NOT tying with embedding)
         self.weight = nnx.Param(
             jnp.zeros((self.num_embeddings_per_partition, embedding_dim))
         )
-        self._tied_embed: Optional[VocabParallelEmbedding] = None
+        # Use nnx.data() so NNX treats this as a dynamic value, not a
+        # static pytree field (avoids "Cannot assign Module to static attr" error)
+        self._tied_embed: nnx.data = nnx.data(None)
 
     def tie_weights(self, embed: VocabParallelEmbedding) -> None:
         """Share weight with a VocabParallelEmbedding module.
@@ -120,7 +118,7 @@ class ParallelLMHead(nnx.Module):
         """
         assert embed.num_embeddings == self.num_embeddings
         assert embed.embedding_dim == self.embedding_dim
-        self._tied_embed = embed
+        self._tied_embed = nnx.data(embed)
 
     def load_weight(self, weight: jax.Array) -> None:
         """Load LM head weight shard for this tp_rank.
@@ -130,14 +128,14 @@ class ParallelLMHead(nnx.Module):
         """
         start = self.tp_rank * self.num_embeddings_per_partition
         end = start + self.num_embeddings_per_partition
-        shard = weight[start:end, :]
-        self.weight = nnx.Param(jnp.array(shard))
+        self.weight = nnx.Param(jnp.array(weight[start:end, :]))
 
     @property
     def effective_weight(self) -> jax.Array:
         """Return the weight to use — tied embed or own weight."""
-        if self._tied_embed is not None:
-            return self._tied_embed.weight.value
+        embed = self._tied_embed.value if hasattr(self._tied_embed, 'value') else self._tied_embed
+        if embed is not None:
+            return embed.weight.value
         return self.weight.value
 
     def __call__(
@@ -148,16 +146,12 @@ class ParallelLMHead(nnx.Module):
         """Compute vocab logits.
 
         Args:
-            x:            hidden states (seq_len, hidden_dim) or (batch, seq, hidden)
-            last_indices: optional 1-D int array; if given, selects x[last_indices]
-                          before projection (used in prefill to get last-token logits).
+            x:            hidden states (seq_len, hidden_dim)
+            last_indices: optional 1-D int array; selects x[last_indices]
+                          before projection (prefill last-token logits).
         Returns:
-            logits (num_selected, vocab_size_per_partition) or after gather:
-            (num_selected, full_vocab_size) when tp_size > 1 and rank == 0.
+            logits (..., vocab_size_per_partition)
         """
         if last_indices is not None:
             x = x[last_indices]
-        # (N, hidden) @ (hidden, vocab_partition) -> (N, vocab_partition)
-        logits = x @ self.effective_weight.T
-        # TP > 1: all-gather across ranks (Phase 7)
-        return logits
+        return x @ self.effective_weight.T
