@@ -11,9 +11,9 @@ lm_head 始终使用自身的 self.weight (nnx.Param)。
 
 _param_array 优先级
 -------------------
-1. param.value   — nnx.Variable 标准存储字段（所有版本）
-2. get_value()   — Flax >= 0.10 备用
-3. param[...]    — 最后 fallback
+根据当前 Flax 版本 deprecation 警告：
+  - param.value 已被废弃 → 使用 param[...] (Variable.__getitem__)
+  - get_value() 保留作为 fallback
 """
 from __future__ import annotations
 from typing import Optional
@@ -23,12 +23,20 @@ from flax import nnx
 
 
 def _param_array(param: nnx.Param) -> jax.Array:
-    """Extract a plain jax.Array from an nnx.Param."""
-    if hasattr(param, 'value'):
-        return jnp.asarray(param.value)
+    """Extract a plain jax.Array from an nnx.Param.
+
+    根据 deprecation 提示：Variable[Array] 应该用 param[...]。
+    """
+    # param[...] 是 Variable.__getitem__ 的正确调用方式
+    try:
+        return jnp.asarray(param[...])
+    except Exception:
+        pass
+    # fallback: get_value()
     if hasattr(param, 'get_value'):
         return jnp.asarray(param.get_value())
-    return jnp.asarray(param[...])
+    # last resort
+    return jnp.asarray(param.value)
 
 
 class VocabParallelEmbedding(nnx.Module):
@@ -86,7 +94,7 @@ class ParallelLMHead(nnx.Module):
         self.weight = nnx.Param(jnp.zeros((self.num_embeddings_per_partition, embedding_dim)))
 
     def load_weight(self, weight: jax.Array) -> None:
-        """weight shape: (full_vocab, hidden) — 自动按 tp_rank 切片."""
+        """weight shape: (full_vocab, hidden) — 自动按 tp_rank 切片。"""
         start = self.tp_rank * self.num_embeddings_per_partition
         end   = start + self.num_embeddings_per_partition
         arr = jnp.asarray(weight[start:end, :])

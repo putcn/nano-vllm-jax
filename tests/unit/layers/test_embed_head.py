@@ -111,27 +111,31 @@ def test_lm_head_last_indices():
 
 
 def test_weight_tying():
-    """Tied weights: caller passes embed weight as weight_override."""
+    """Tied weights: lm_head.load_weight receives embed_tokens weights at load time.
+
+    New design (post weight_override removal): LlamaForCausalLM.load_weights()
+    copies embed_tokens.weight_array into lm_head.weight when
+    tie_word_embeddings=True.  This test mirrors that pattern directly.
+    """
     vocab, dim = 128, 32
     w_np = rand((vocab, dim))
     emb = VocabParallelEmbedding(vocab, dim)
     emb.load_weight(jnp.array(w_np))
+
     head = ParallelLMHead(vocab, dim)
+    # Simulate what LlamaForCausalLM.load_weights does for tied models.
+    head.load_weight(emb.weight_array)
+
     x_np = rand((4, dim))
-    # Pass embed weight explicitly, simulating LlamaForCausalLM behaviour.
-    np.testing.assert_allclose(
-        np.array(head(jnp.array(x_np), weight_override=emb.weight_array)),
-        x_np @ w_np.T,
-        atol=ATOL_MATMUL,
-    )
-    # After updating embed weights, weight_override reflects the new values.
+    out = np.array(head(jnp.array(x_np)))
+    np.testing.assert_allclose(out, x_np @ w_np.T, atol=ATOL_MATMUL)
+
+    # Updating embed and re-copying reflects new values.
     new_w = rand((vocab, dim), seed=99)
     emb.load_weight(jnp.array(new_w))
-    np.testing.assert_allclose(
-        np.array(head(jnp.array(x_np), weight_override=emb.weight_array)),
-        x_np @ new_w.T,
-        atol=ATOL_MATMUL,
-    )
+    head.load_weight(emb.weight_array)  # re-copy, as load_weights() would do on reload
+    out2 = np.array(head(jnp.array(x_np)))
+    np.testing.assert_allclose(out2, x_np @ new_w.T, atol=ATOL_MATMUL)
 
 
 def test_lm_head_jit():
