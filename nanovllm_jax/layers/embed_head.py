@@ -5,16 +5,22 @@ Status: ✅ Fixed (weight tying via explicit weight_override — no cross-module
 Weight tying design
 -------------------
 Previous approaches stored a reference to VocabParallelEmbedding inside
-ParallelLMHead (via nnx.data or object.__setattr__).  Both caused nnx.jit to
-detect the same Param appearing in two graph nodes at different trace levels:
+ParallelLMHead (via nnx.data or object.__setattr__).  Both caused nnx.jit
+to detect the same Param appearing in two graph nodes at different trace
+levels:
 
   ValueError: Cannot extract graph node from different trace level
 
 The correct solution: ParallelLMHead holds NO reference to embed_tokens.
 Instead, LlamaForCausalLM.__call__ passes embed_tokens.weight_array as an
 explicit ``weight_override`` argument when tie_word_embeddings=True.  From
-JAX/NNX's perspective this is just a plain Array argument — no shared nodes,
+JAX/NNX’s perspective this is just a plain Array argument — no shared nodes,
 no trace level conflict.
+
+``effective_weight`` is kept as a public property so that unit tests
+(test_prefill_last_indices) can access the module’s own weight directly
+for reference computations.  It always returns this module’s own weight;
+the tied-embed weight is delivered exclusively via ``weight_override``.
 """
 from __future__ import annotations
 from typing import Optional
@@ -93,6 +99,17 @@ class ParallelLMHead(nnx.Module):
         arr = jnp.asarray(weight[start:end, :])
         self.weight = nnx.Param(arr)
 
+    @property
+    def effective_weight(self) -> jax.Array:
+        """Return this module's own weight as a plain jax.Array.
+
+        For tied-weight models the actual weight used at inference time is
+        delivered via the ``weight_override`` argument to ``__call__`` by
+        LlamaForCausalLM.  This property exposes the module-local weight so
+        that unit tests can use it as a numerical reference.
+        """
+        return _param_array(self.weight)
+
     def __call__(
         self,
         x: jax.Array,
@@ -103,13 +120,13 @@ class ParallelLMHead(nnx.Module):
 
         Args:
             x: hidden states, shape [T, hidden_size]
-            last_indices: if provided, select x[last_indices] before matmul
-            weight_override: if provided (for tied-weight models), use this
-                array instead of self.weight.  Caller (LlamaForCausalLM)
-                passes embed_tokens.weight_array here so that JIT sees it as
-                a plain Array argument — no shared-node trace level conflict.
+            last_indices: if provided, select x[last_indices] before matmul.
+            weight_override: if provided (tied-weight models), use this array
+                instead of self.weight.  LlamaForCausalLM passes
+                embed_tokens.weight_array here so JIT sees a plain Array
+                argument — no shared-node trace-level conflict.
         """
         if last_indices is not None:
             x = x[last_indices]
-        w = weight_override if weight_override is not None else _param_array(self.weight)
+        w = weight_override if weight_override is not None else self.effective_weight
         return x @ w.T
