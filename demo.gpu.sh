@@ -94,6 +94,7 @@ print(f"  num_attention_heads= {mc.num_attention_heads}")
 print(f"  num_key_value_heads= {mc.num_key_value_heads}")
 print(f"  head_dim           = {mc.head_dim}")
 print(f"  hidden_size        = {mc.hidden_size}")
+print(f"  tie_word_embeddings= {mc.tie_word_embeddings}")
 
 kv_cache = PagedKVCache(
     num_layers=mc.num_hidden_layers,
@@ -106,14 +107,34 @@ kv_cache = PagedKVCache(
 
 block_manager = BlockManager(num_blocks=num_blocks, block_size=16)
 
-# ── 3. 只用第一条 prompt 做单条 prefill debug ────────────────────────────────
-prompt = "The capital of France is"
-input_ids = tok.encode(prompt)
-print(f"\n[DEBUG] Prompt: {prompt!r}")
+# ── 3. 构建 chat-template prompt（禁用 Qwen3 thinking 模式）─────────────────
+# Qwen3 是 thinking model，base-prompt 续写不会回答事实性问题。
+# 必须用 chat template 并传入 enable_thinking=False 才能得到直接回答。
+raw_question = "What is the capital of France? Answer in one word."
+messages = [{"role": "user", "content": raw_question}]
+try:
+    # Qwen3 tokenizer 支持 enable_thinking 参数
+    prompt = tok.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+except TypeError:
+    # 其他模型（Llama 等）不支持 enable_thinking，正常调用
+    prompt = tok.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+input_ids = tok.encode(prompt, add_special_tokens=False)
+print(f"\n[DEBUG] Question : {raw_question!r}")
+print(f"[DEBUG] Prompt   : {prompt!r}")
 print(f"[DEBUG] Token IDs ({len(input_ids)}): {input_ids}")
 
-sp = SamplingParams(temperature=0.0, max_tokens=max_tokens)
-seq = Sequence(seq_id=0, prompt_token_ids=input_ids, sampling_params=sp)
+sp = Seq = Sequence(seq_id=0, prompt_token_ids=input_ids, sampling_params=SamplingParams(temperature=0.0, max_tokens=max_tokens))
+seq = sp
 
 # 分配 KV block
 block_manager.allocate(seq)
@@ -142,8 +163,6 @@ print(f"\n[DEBUG] Prefill 输入:")
 print(f"  T_real={T}, T_pad={T_pad}")
 print(f"  ids      = {np.array(all_ids)}")
 print(f"  pos      = {np.array(all_pos)}")
-print(f"  bi       = {np.array(all_bi)}")
-print(f"  bo       = {np.array(all_bo)}")
 print(f"  seq_lens = {np.array(seq_lens)}")
 print(f"  last_idx = {np.array(last_indices)}")
 
@@ -153,7 +172,7 @@ logits = _jit_prefill(
     all_ids, all_pos, all_bi, all_bo, seq_lens, last_indices,
     num_real_tokens=T,
 )
-logits_np = np.array(logits)  # shape: [1, vocab_size]
+logits_np = np.array(logits, dtype=np.float32)  # 转 float32 确保格式化正常
 print(f"\n[DEBUG] Prefill logits shape: {logits_np.shape}")
 print(f"  logits[0] min={logits_np[0].min():.4f}  max={logits_np[0].max():.4f}  mean={logits_np[0].mean():.4f}")
 print(f"  有 NaN? {np.isnan(logits_np).any()}  有 Inf? {np.isinf(logits_np).any()}")
@@ -180,7 +199,6 @@ for step_i in range(5):
     dec_bi   = jnp.array([seq.block_table[blk_num]], dtype=jnp.int32)
     dec_bo   = jnp.array([blk_off], dtype=jnp.int32)
     dec_lens = jnp.array([seq.total_len], dtype=jnp.int32)
-    max_blocks = len(seq.block_table)
     dec_bt   = jnp.array([list(seq.block_table)], dtype=jnp.int32)
 
     dec_logits = _jit_decode(
@@ -188,21 +206,29 @@ for step_i in range(5):
         dec_ids, dec_pos, dec_bi, dec_bo, dec_lens, dec_bt,
         num_real_seqs=1,
     )
-    dec_np = np.array(dec_logits)
+    dec_np = np.array(dec_logits, dtype=np.float32)  # 转 float32
     next_tok = int(np.argmax(dec_np[0]))
 
     print(f"  step {step_i+1}: in={tok.decode([seq.last_token_id])!r}  "
           f"logit_max={dec_np[0].max():.3f}  logit_min={dec_np[0].min():.3f}  "
-          f"→ out id={next_tok}  text={tok.decode([next_tok])!r}")
+          f"-> out id={next_tok}  text={tok.decode([next_tok])!r}")
 
     seq.append_token(next_tok)
 
+print(f"\n[DEBUG] 生成结果: {tok.decode(seq.all_token_ids[T:])!r}")
+
 # ── 6. KV cache 健康检查 ──────────────────────────────────────────────────
 import jax
-cache_arr = jax.device_get(kv_cache.cache.get_value() if hasattr(kv_cache.cache, 'get_value') else kv_cache.cache.value)
+if hasattr(kv_cache.cache, 'get_value'):
+    cache_arr = np.array(jax.device_get(kv_cache.cache.get_value()), dtype=np.float32)
+elif hasattr(kv_cache.cache, 'value'):
+    cache_arr = np.array(jax.device_get(kv_cache.cache.value), dtype=np.float32)
+else:
+    cache_arr = np.array(jax.device_get(kv_cache.cache), dtype=np.float32)
+
 print(f"\n[DEBUG] KV cache shape: {cache_arr.shape}")
-print(f"  layer0 key block0: mean abs = {np.abs(cache_arr[0, 0, 0]).mean():.6f}")
-print(f"  layer0 key block1: mean abs = {np.abs(cache_arr[0, 0, 1]).mean():.6f}")
+print(f"  layer0 key block0: mean abs = {float(np.abs(cache_arr[0, 0, 0]).mean()):.6f}")
+print(f"  layer0 key block1: mean abs = {float(np.abs(cache_arr[0, 0, 1]).mean()):.6f}")
 nonzero_blocks = (np.abs(cache_arr[0, 0]).sum(axis=(-1,-2,-3)) > 0).sum()
 print(f"  非零 key blocks (layer0): {nonzero_blocks} / {cache_arr.shape[2]}")
 
