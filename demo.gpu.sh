@@ -1,16 +1,5 @@
 #!/usr/bin/env bash
 # demo.gpu.sh — NVIDIA GPU demo (CUDA 12, requires nvidia-container-toolkit)
-#
-# Usage:
-#   bash demo.gpu.sh
-#   GPU_ID=0 bash demo.gpu.sh
-#   MODEL=Qwen/Qwen3-1.7B NUM_BLOCKS=1024 bash demo.gpu.sh
-#   MODEL_PATH=$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/latest \
-#     bash demo.gpu.sh
-#
-# Prerequisites:
-#   nvidia-smi
-#   docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
 set -euo pipefail
 
 MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
@@ -25,10 +14,11 @@ echo "    model      : ${MODEL_PATH:-$MODEL}"
 echo "    max_tokens : $MAX_TOKENS"
 echo "    num_blocks : $NUM_BLOCKS"
 echo "    GPU        : $GPU_ID"
-echo "    HF cache   : $HF_CACHE (mounted from host)"
+echo "    HF cache   : $HF_CACHE"
 echo ""
 
-docker build -q -f docker/Dockerfile.gpu -t nano-vllm-jax:gpu . 2>&1 | tail -3
+# Force rebuild to avoid stale .pyc in Docker layer cache
+docker build --no-cache -q -f docker/Dockerfile.gpu -t nano-vllm-jax:gpu . 2>&1 | tail -5
 
 if [ "$GPU_ID" = "all" ]; then
   GPU_FLAG="--gpus all"
@@ -61,7 +51,6 @@ model_path = os.environ.get("MODEL_PATH", "").strip()
 max_tokens = int(os.environ.get("MAX_TOKENS", 128))
 num_blocks = int(os.environ.get("NUM_BLOCKS", 512))
 
-# ── 1. 模型路径解析 ─────────────────────────────────────────────────────────
 from huggingface_hub import snapshot_download
 if model_path and pathlib.Path(model_path).exists():
     resolved = model_path
@@ -74,11 +63,10 @@ else:
 
 print(f"\nLoading model from {resolved} ...")
 
-# ── 2. 直接加载模型，跳过 LLM 包装层，方便插入 debug hook ──────────────────
 from nanovllm_jax.loader.model_registry import load_model
 from nanovllm_jax.layers.attention import PagedKVCache
-from nanovllm_jax.engine.model_runner import ModelRunner, _jit_prefill, _jit_decode, _next_pow2
-from nanovllm_jax.engine.sequence import Sequence, SequenceStatus
+from nanovllm_jax.engine.model_runner import _jit_prefill, _jit_decode, _next_pow2
+from nanovllm_jax.engine.sequence import Sequence
 from nanovllm_jax.engine.block_manager import BlockManager
 from nanovllm_jax.sampling_params import SamplingParams
 from transformers import AutoTokenizer
@@ -89,13 +77,55 @@ mc = model.config
 
 print(f"\n[DEBUG] 模型配置:")
 print(f"  vocab_size         = {mc.vocab_size}")
-print(f"  num_hidden_layers  = {mc.num_hidden_layers}")
-print(f"  num_attention_heads= {mc.num_attention_heads}")
-print(f"  num_key_value_heads= {mc.num_key_value_heads}")
-print(f"  head_dim           = {mc.head_dim}")
-print(f"  hidden_size        = {mc.hidden_size}")
 print(f"  tie_word_embeddings= {mc.tie_word_embeddings}")
+print(f"  hidden_size        = {mc.hidden_size}")
 
+# ============================================================
+# 权重绑定诊断：在 JIT 外部直接比较两个权重
+# ============================================================
+print("\n[DIAG] === 权重绑定检查 ===")
+
+# embed_tokens 权重
+embed_w = np.array(model.model.embed_tokens.weight_array, dtype=np.float32)
+print(f"  embed_tokens.weight_array  shape={embed_w.shape}  norm={np.linalg.norm(embed_w):.4f}  max_abs={np.abs(embed_w).max():.6f}")
+print(f"  embed_tokens.weight_array  is_zero={np.abs(embed_w).max() == 0}")
+print(f"  embed_tokens.weight_array  sample[0,:5]={embed_w[0,:5].tolist()}")
+
+# lm_head 自身权重方 (effective_weight 返回自身 weight)
+lmh_w = np.array(model.lm_head.effective_weight, dtype=np.float32)
+print(f"  lm_head.effective_weight   shape={lmh_w.shape}  norm={np.linalg.norm(lmh_w):.4f}  max_abs={np.abs(lmh_w).max():.6f}")
+print(f"  lm_head.effective_weight   is_zero={np.abs(lmh_w).max() == 0}")
+print(f"  lm_head.effective_weight   sample[0,:5]={lmh_w[0,:5].tolist()}")
+
+if mc.tie_word_embeddings:
+    are_equal = np.allclose(embed_w, lmh_w, atol=1e-4)
+    print(f"  tie_word_embeddings=True → embed_w == lmh_w? {are_equal}")
+    if not are_equal:
+        diff = np.abs(embed_w - lmh_w).max()
+        print(f"  !! 不相等！max_diff={diff:.6f}")
+        print(f"  说明 lm_head 没有正确使用 embed_tokens 权重")
+
+# 在 JIT 外直接计算一个 token 的 logit，确认模型本身正常
+print("\n[DIAG] === 直接推理校验（单 token, 不过 JIT）===")
+# 取 token 'Paris' 的 id
+paris_ids = tok.encode("Paris", add_special_tokens=False)
+print(f"  'Paris' token ids: {paris_ids}")
+
+# 构造一个极简单的 one-hot 输入，知道 embed_tokens(输入) = embed_w[输入]
+test_id = 151644  # <|im_start|> token 一定在词表里
+hidden_direct = embed_w[test_id]  # shape (hidden_size,)
+if mc.tie_word_embeddings:
+    # weight_override = embed_w
+    logit_direct = hidden_direct @ embed_w.T  # (vocab_size,)
+else:
+    logit_direct = hidden_direct @ lmh_w.T
+print(f"  直接计算 logit[{test_id}] top-5 ids: {np.argsort(logit_direct)[::-1][:5].tolist()}")
+print(f"  直接计算 logit[{test_id}] top-5 vals: {logit_direct[np.argsort(logit_direct)[::-1][:5]].tolist()}")
+print(f"  argmax={np.argmax(logit_direct)}  text={tok.decode([int(np.argmax(logit_direct))])!r}")
+
+# ============================================================
+# 正常推理
+# ============================================================
 kv_cache = PagedKVCache(
     num_layers=mc.num_hidden_layers,
     num_kv_heads=mc.num_key_value_heads,
@@ -104,43 +134,30 @@ kv_cache = PagedKVCache(
     block_size=16,
     dtype=jnp.bfloat16,
 )
-
 block_manager = BlockManager(num_blocks=num_blocks, block_size=16)
 
-# ── 3. 构建 chat-template prompt（禁用 Qwen3 thinking 模式）─────────────────
-# Qwen3 是 thinking model，base-prompt 续写不会回答事实性问题。
-# 必须用 chat template 并传入 enable_thinking=False 才能得到直接回答。
 raw_question = "What is the capital of France? Answer in one word."
 messages = [{"role": "user", "content": raw_question}]
 try:
-    # Qwen3 tokenizer 支持 enable_thinking 参数
     prompt = tok.apply_chat_template(
-        messages,
-        tokenize=False,
+        messages, tokenize=False,
         add_generation_prompt=True,
         enable_thinking=False,
     )
 except TypeError:
-    # 其他模型（Llama 等）不支持 enable_thinking，正常调用
     prompt = tok.apply_chat_template(
-        messages,
-        tokenize=False,
+        messages, tokenize=False,
         add_generation_prompt=True,
     )
 
 input_ids = tok.encode(prompt, add_special_tokens=False)
 print(f"\n[DEBUG] Question : {raw_question!r}")
-print(f"[DEBUG] Prompt   : {prompt!r}")
 print(f"[DEBUG] Token IDs ({len(input_ids)}): {input_ids}")
 
-sp = Seq = Sequence(seq_id=0, prompt_token_ids=input_ids, sampling_params=SamplingParams(temperature=0.0, max_tokens=max_tokens))
-seq = sp
-
-# 分配 KV block
+seq = Sequence(seq_id=0, prompt_token_ids=input_ids,
+               sampling_params=SamplingParams(temperature=0.0, max_tokens=max_tokens))
 block_manager.allocate(seq)
-print(f"[DEBUG] 分配后 block_table: {seq.block_table}")
 
-# 手动构建 prefill 输入
 T = len(input_ids)
 all_ids = jnp.array(input_ids, dtype=jnp.int32)
 all_pos = jnp.arange(T, dtype=jnp.int32)
@@ -152,85 +169,47 @@ last_indices = jnp.array([T - 1], dtype=jnp.int32)
 T_pad = _next_pow2(T)
 def pad1d(a, n, v=0):
     return jnp.pad(a, (0, n - a.shape[0]), constant_values=v)
-
 if T_pad != T:
     all_ids = pad1d(all_ids, T_pad)
     all_pos = pad1d(all_pos, T_pad)
-    all_bi  = pad1d(all_bi,  T_pad)
-    all_bo  = pad1d(all_bo,  T_pad)
+    all_bi  = pad1d(all_bi, T_pad)
+    all_bo  = pad1d(all_bo, T_pad)
 
-print(f"\n[DEBUG] Prefill 输入:")
-print(f"  T_real={T}, T_pad={T_pad}")
-print(f"  ids      = {np.array(all_ids)}")
-print(f"  pos      = {np.array(all_pos)}")
-print(f"  seq_lens = {np.array(seq_lens)}")
-print(f"  last_idx = {np.array(last_indices)}")
-
-# ── 4. 运行 prefill，打印 logit 统计 ─────────────────────────────────────────
 logits = _jit_prefill(
     model, kv_cache,
     all_ids, all_pos, all_bi, all_bo, seq_lens, last_indices,
     num_real_tokens=T,
 )
-logits_np = np.array(logits, dtype=np.float32)  # 转 float32 确保格式化正常
+logits_np = np.array(logits, dtype=np.float32)
 print(f"\n[DEBUG] Prefill logits shape: {logits_np.shape}")
-print(f"  logits[0] min={logits_np[0].min():.4f}  max={logits_np[0].max():.4f}  mean={logits_np[0].mean():.4f}")
-print(f"  有 NaN? {np.isnan(logits_np).any()}  有 Inf? {np.isinf(logits_np).any()}")
-
+print(f"  min={logits_np[0].min():.4f}  max={logits_np[0].max():.4f}")
 top5_idx = np.argsort(logits_np[0])[::-1][:5]
-print(f"  Top-5 token ids: {top5_idx.tolist()}")
-print(f"  Top-5 logit val: {logits_np[0][top5_idx].tolist()}")
-print(f"  Top-5 tokens   : {[tok.decode([i]) for i in top5_idx]}")
+print(f"  Top-5 tokens: {[tok.decode([i]) for i in top5_idx]}")
 
 argmax_token = int(np.argmax(logits_np[0]))
-print(f"\n[DEBUG] Prefill argmax token: id={argmax_token}  text={tok.decode([argmax_token])!r}")
+print(f"\n[DEBUG] Prefill argmax: id={argmax_token}  text={tok.decode([argmax_token])!r}")
 
-# ── 5. 多步 decode debug（前 5 步）──────────────────────────────────────────
+# 多步 decode
 print(f"\n[DEBUG] ===== Decode 前5步 =====")
 seq.append_token(argmax_token)
-
 for step_i in range(5):
     step = seq.total_len - 1
-    blk_num = step // 16
-    blk_off = step % 16
-
     dec_ids  = jnp.array([seq.last_token_id], dtype=jnp.int32)
     dec_pos  = jnp.array([step], dtype=jnp.int32)
-    dec_bi   = jnp.array([seq.block_table[blk_num]], dtype=jnp.int32)
-    dec_bo   = jnp.array([blk_off], dtype=jnp.int32)
+    dec_bi   = jnp.array([seq.block_table[step // 16]], dtype=jnp.int32)
+    dec_bo   = jnp.array([step % 16], dtype=jnp.int32)
     dec_lens = jnp.array([seq.total_len], dtype=jnp.int32)
     dec_bt   = jnp.array([list(seq.block_table)], dtype=jnp.int32)
-
     dec_logits = _jit_decode(
         model, kv_cache,
         dec_ids, dec_pos, dec_bi, dec_bo, dec_lens, dec_bt,
         num_real_seqs=1,
     )
-    dec_np = np.array(dec_logits, dtype=np.float32)  # 转 float32
+    dec_np = np.array(dec_logits, dtype=np.float32)
     next_tok = int(np.argmax(dec_np[0]))
-
-    print(f"  step {step_i+1}: in={tok.decode([seq.last_token_id])!r}  "
-          f"logit_max={dec_np[0].max():.3f}  logit_min={dec_np[0].min():.3f}  "
-          f"-> out id={next_tok}  text={tok.decode([next_tok])!r}")
-
+    print(f"  step {step_i+1}: in={tok.decode([seq.last_token_id])!r}  -> out={tok.decode([next_tok])!r}")
     seq.append_token(next_tok)
 
 print(f"\n[DEBUG] 生成结果: {tok.decode(seq.all_token_ids[T:])!r}")
-
-# ── 6. KV cache 健康检查 ──────────────────────────────────────────────────
-import jax
-if hasattr(kv_cache.cache, 'get_value'):
-    cache_arr = np.array(jax.device_get(kv_cache.cache.get_value()), dtype=np.float32)
-elif hasattr(kv_cache.cache, 'value'):
-    cache_arr = np.array(jax.device_get(kv_cache.cache.value), dtype=np.float32)
-else:
-    cache_arr = np.array(jax.device_get(kv_cache.cache), dtype=np.float32)
-
-print(f"\n[DEBUG] KV cache shape: {cache_arr.shape}")
-print(f"  layer0 key block0: mean abs = {float(np.abs(cache_arr[0, 0, 0]).mean()):.6f}")
-print(f"  layer0 key block1: mean abs = {float(np.abs(cache_arr[0, 0, 1]).mean()):.6f}")
-nonzero_blocks = (np.abs(cache_arr[0, 0]).sum(axis=(-1,-2,-3)) > 0).sum()
-print(f"  非零 key blocks (layer0): {nonzero_blocks} / {cache_arr.shape[2]}")
-
-print("\n[DEBUG] ===== 诊断完成 =====\n")
+print("\n[DEBUG] ===== 诺断完成 =====\n")
 PYEOF
