@@ -14,13 +14,20 @@ levels:
 The correct solution: ParallelLMHead holds NO reference to embed_tokens.
 Instead, LlamaForCausalLM.__call__ passes embed_tokens.weight_array as an
 explicit ``weight_override`` argument when tie_word_embeddings=True.  From
-JAX/NNX’s perspective this is just a plain Array argument — no shared nodes,
+JAX/NNX's perspective this is just a plain Array argument — no shared nodes,
 no trace level conflict.
 
 ``effective_weight`` is kept as a public property so that unit tests
-(test_prefill_last_indices) can access the module’s own weight directly
-for reference computations.  It always returns this module’s own weight;
+(test_prefill_last_indices) can access the module's own weight directly
+for reference computations.  It always returns this module's own weight;
 the tied-embed weight is delivered exclusively via ``weight_override``.
+
+_param_array priority
+---------------------
+nnx.Variable stores its concrete value in the ``.value`` attribute.
+Using ``get_value()`` or ``param[...]`` can return a lazy/sharded view
+in some Flax NNX versions, producing garbage logits.  Always read
+``.value`` first.
 """
 from __future__ import annotations
 from typing import Optional
@@ -30,12 +37,15 @@ from flax import nnx
 
 
 def _param_array(param: nnx.Param) -> jax.Array:
-    """Extract a plain jax.Array from an nnx.Param, compatible with all Flax versions.
+    """Extract a plain jax.Array from an nnx.Param.
 
     Priority:
-      1. get_value()   — Flax >= 0.10 canonical non-deprecated path
-      2. param[...]    — nnx Variable __getitem__ (works on all recent versions)
+      1. param.value   — canonical nnx.Variable storage field (all versions)
+      2. get_value()   — Flax >= 0.10 alternative
+      3. param[...]    — fallback __getitem__
     """
+    if hasattr(param, 'value'):
+        return jnp.asarray(param.value)
     if hasattr(param, 'get_value'):
         return jnp.asarray(param.get_value())
     return jnp.asarray(param[...])
@@ -62,10 +72,15 @@ class VocabParallelEmbedding(nnx.Module):
     def load_weight(self, weight: jax.Array) -> None:
         arr = jnp.asarray(weight[self.vocab_start_idx:self.vocab_end_idx, :])
         self.weight = nnx.Param(arr)
+        # Sanity: freshly loaded weights must not be all-zeros
+        assert float(jnp.abs(arr).max()) > 0, (
+            f"VocabParallelEmbedding.load_weight: loaded weight is all-zeros "
+            f"(shape={arr.shape}). Check weight key mapping."
+        )
 
     @property
     def weight_array(self) -> jax.Array:
-        """Return the underlying weight as a plain jax.Array (single allocation)."""
+        """Return the underlying weight as a plain jax.Array."""
         return _param_array(self.weight)
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -98,6 +113,10 @@ class ParallelLMHead(nnx.Module):
         end = start + self.num_embeddings_per_partition
         arr = jnp.asarray(weight[start:end, :])
         self.weight = nnx.Param(arr)
+        assert float(jnp.abs(arr).max()) > 0, (
+            f"ParallelLMHead.load_weight: loaded weight is all-zeros "
+            f"(shape={arr.shape}). Check weight key mapping."
+        )
 
     @property
     def effective_weight(self) -> jax.Array:
