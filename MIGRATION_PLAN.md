@@ -10,7 +10,7 @@
 
 ## Overview
 
-This project rewrites the `nano-vllm` LLM inference engine — originally built on PyTorch — using [JAX](https://github.com/google/jax) + [Flax](https://github.com/google/flax) (NNX) as the deep learning backend. The goal is to leverage JAX's functional programming model, `jit` compilation, `vmap`/`pmap` for multi-device parallelism, and XLA-based kernel fusion for high-performance LLM inference.
+This project rewrites the `nano-vllm` LLM inference engine — originally built on PyTorch — using [JAX](https://github.com/google/jax) + [Flax](https://github.com/google/flax) (NNX) as the deep learning backend. The goal is to leverage JAX’s functional programming model, `jit` compilation, `vmap`/`pmap` for multi-device parallelism, and XLA-based kernel fusion for high-performance LLM inference.
 
 ### Key Principles
 - **Functional purity**: Replace stateful `nn.Module` (PyTorch) with `flax.nnx` or pure JAX functions.
@@ -28,13 +28,13 @@ This project rewrites the `nano-vllm` LLM inference engine — originally built 
 | Config | `nanovllm/config.py` | `nanovllm_jax/config.py` | ✅ Done |
 | Sampling Params | `nanovllm/sampling_params.py` | `nanovllm_jax/sampling_params.py` | ✅ Done |
 | Activation (SiLU/GeGLU) | `nanovllm/layers/activation.py` | `nanovllm_jax/layers/activation.py` | ✅ Done |
-| RMSNorm / LayerNorm | `nanovllm/layers/layernorm.py` | `nanovllm_jax/layers/layernorm.py` | ✅ Done |
+| RMSNorm / PerHeadRMSNorm | `nanovllm/layers/layernorm.py` | `nanovllm_jax/layers/layernorm.py` | ✅ Done |
 | Rotary Embedding (RoPE) | `nanovllm/layers/rotary_embedding.py` | `nanovllm_jax/layers/rotary_embedding.py` | ✅ Done |
 | Linear (column/row parallel) | `nanovllm/layers/linear.py` | `nanovllm_jax/layers/linear.py` | ✅ Done |
 | Embed + LM Head | `nanovllm/layers/embed_head.py` | `nanovllm_jax/layers/embed_head.py` | ✅ Done |
 | Attention (PagedKV) | `nanovllm/layers/attention.py` | `nanovllm_jax/layers/attention.py` | ✅ Done |
 | Sampler | `nanovllm/layers/sampler.py` | `nanovllm_jax/layers/sampler.py` | ✅ Done |
-| LLaMA Model | `nanovllm/models/llama.py` | `nanovllm_jax/models/llama.py` | ✅ Done |
+| LLaMA / Qwen3 Model | `nanovllm/models/llama.py` | `nanovllm_jax/models/llama.py` | ✅ Done |
 | HF Weight Loader | *(new)* | `nanovllm_jax/loader/weight_loader.py` | ✅ Done |
 | Model Registry | *(new)* | `nanovllm_jax/loader/model_registry.py` | ✅ Done |
 | Sequence | `nanovllm/engine/sequence.py` | `nanovllm_jax/engine/sequence.py` | ✅ Done |
@@ -74,11 +74,14 @@ This project rewrites the `nano-vllm` LLM inference engine — originally built 
 - `silu_and_mul` + `SiluAndMul` NNX wrapper. atol=1e-5 vs PyTorch.
 
 #### 1.3 RMSNorm ✅
-- Fused add+norm path. atol=1e-5.
+- `RMSNorm`: fused add+norm path, float32 internal compute, output dtype matches input. atol=1e-5.
+- `PerHeadRMSNorm`: per-head RMSNorm for Qwen3 QK-Norm. Input `(T, num_heads, head_dim)`,
+  normalises along `head_dim`, weight shape `(head_dim,)` shared across heads.
 - **Bug fixed**: `jnp.cos/sin` free functions; weight dtype cast.
 
 #### 1.4 Rotary Embedding (RoPE) ✅
 - Full LRU cache, identity test, long-seq 4096, jit. atol=1e-4.
+- Matches Qwen3 style: `emb = concat([freqs, freqs])`, rotation `[-x2, x1]`.
 
 ---
 
@@ -94,16 +97,22 @@ This project rewrites the `nano-vllm` LLM inference engine — originally built 
 
 - `PagedKVCache`: layout `[layers, 2, blocks, block_size, kv_heads, head_dim]`, functional `.at[].set()` writes.
 - `Attention`: prefill causal + decode paged lookup + GQA repeat.
+- `_make_batched_causal_mask`: block-diagonal mask preventing cross-sequence attention in packed prefill.
 - `Sampler`: greedy / top-k / top-p via `jax.random.categorical`.
 - **Bug fixed**: test index `k_out[seq, pos, head, :]`.
 
 ---
 
-### Phase 4 — Full LLaMA Model ✅
+### Phase 4 — Full LLaMA / Qwen3 Model ✅
 
 - `LlamaConfig`, `LlamaMLP`, `LlamaAttention`, `LlamaDecoderLayer`, `LlamaModel`, `LlamaForCausalLM`.
 - `load_weights()` accepts flat HF param dicts on every class.
-- **Bug fixed**: `nnx.List` instead of plain Python list; non-zero weight test helper.
+- **Qwen3 QK-Norm**: `LlamaAttention` applies `PerHeadRMSNorm` to Q and K *before* RoPE,
+  using weights `self_attn.q_norm.weight` / `self_attn.k_norm.weight` (shape `head_dim`).
+  Falls back to identity (weight=ones) for plain Llama models that lack these weights.
+- **Bug fixed**: `nnx.List` instead of plain Python list.
+- **Bug fixed**: residual connections — explicit `x = attn(x) + residual` pattern (pre-norm).
+- **Bug fixed**: `tie_word_embeddings` — copy embed weight into lm_head at load time.
 
 ---
 
@@ -132,9 +141,13 @@ This project rewrites the `nano-vllm` LLM inference engine — originally built 
 - **Bug fixed**: `EngineConfig` flattened (was nested `ModelConfig` + `CacheConfig`); added `max_num_batched_tokens` field.
 
 #### 6.4 Model Runner ✅
-- Lazy model loading; stub model for tests (no checkpoint needed).
-- `_run_prefill` / `_run_decode` build JAX input arrays per sequence.
-- Falls back to `_StubModel` when `config.model == ""`.
+- `nnx.jit` for both `_jit_prefill` and `_jit_decode` — KV cache writes propagate back correctly.
+- Padding to next-power-of-2 token count — O(log N) distinct XLA compilation shapes.
+- `last_indices` passed into `LlamaForCausalLM` so lm_head returns `[num_seqs, vocab]`.
+- `seq_lens` padding uses `val=0` (not `val=1`) to prevent stale KV cache reads.
+- **Bug fixed**: `jax.jit` → `nnx.jit` for KV cache persistence across steps.
+- **Bug fixed**: `last_indices` wiring through prefill path.
+- **Bug fixed**: `seq_lens` padding value `0` prevents phantom context in decode.
 
 ---
 
@@ -153,15 +166,20 @@ This project rewrites the `nano-vllm` LLM inference engine — originally built 
 - Matches nano-vllm signature exactly.
 - **Tests**: single, batch, default params, output order. ✅
 
+#### 7.3 GPU End-to-End Demo ✅
+- `demo.gpu.sh`: Docker-based single-command demo on NVIDIA GPU.
+- Verified correct output on **Qwen3-0.6B** (geography, math, coding, reasoning, translation).
+- Prints prefill latency (ms) and decode throughput (tok/s) per question.
+
 #### Usage
 ```python
 from nanovllm_jax.llm import LLM
 from nanovllm_jax.sampling_params import SamplingParams
 
-llm = LLM("meta-llama/Llama-3.2-1B", num_gpu_blocks=512, block_size=16)
+llm = LLM("Qwen/Qwen3-0.6B", num_gpu_blocks=512, block_size=16)
 outputs = llm.generate(
-    ["Tell me a joke", "What is JAX?"],
-    SamplingParams(temperature=0.8, max_tokens=128),
+    ["What is the capital of France?", "Write a Python palindrome checker."],
+    SamplingParams(temperature=0.0, max_tokens=128),
 )
 for o in outputs:
     print(o.text)
@@ -176,6 +194,149 @@ for o in outputs:
 - [ ] Tensor parallelism via `jax.sharding.NamedSharding`
 - [ ] XLA profiling with `jax.profiler`
 - [ ] Benchmark vs original PyTorch nano-vllm (tokens/sec, TTFT)
+- [ ] e2e tests: `tests/e2e/test_generation.py`, `tests/e2e/test_throughput.py`
+
+---
+
+## Implementation Notes & Bug Log
+
+This section documents design decisions and non-obvious bugs encountered during
+the PyTorch → JAX port. Each entry corresponds to a real bug that was debugged
+and fixed in production.
+
+### 1. JAX Functional Purity and `nnx.jit` (Critical)
+
+PyTorch operations are **eager** and **stateful**. In-place mutations like
+`cache[layer, 0, bi, bo] = keys` are immediately visible everywhere.
+
+JAX’s `jax.jit` compiles a **pure function**. Python-level object mutations
+inside a `jax.jit`-decorated function are **not propagated back** after the
+call returns. For `PagedKVCache.write()` this means:
+
+```python
+new_cache = jax.lax.fori_loop(0, num_real, body, cache)
+self.cache = nnx.Variable(new_cache)   # Python-level mutation — lost under jax.jit
+```
+
+After the JIT call returns, the outer `kv_cache.cache` is still the original
+all-zeros array. Every decode step reads a blank cache — garbage output.
+
+**Fix**: Use `nnx.jit`. It uses `nnx.split` / `nnx.update` to thread all
+`nnx.Variable` state through XLA as mutable arguments, writing updates back
+to Python objects after each call.
+
+```python
+# ❌ Wrong — KV cache writes are silently discarded
+@jax.jit
+def forward(model, kv_cache, ...): ...
+
+# ✅ Correct — KV cache writes propagate back
+@nnx.jit
+def forward(model, kv_cache, ...): ...
+```
+
+---
+
+### 2. `last_indices` in Prefill
+
+During prefill, `T_total` tokens are processed but only the **last token per
+sequence** should produce a logit. `ParallelLMHead` accepts `last_indices`:
+
+```python
+def __call__(self, x, last_indices=None):
+    if last_indices is not None:
+        x = x[last_indices]   # [num_seqs, hidden]
+    return x @ self.effective_weight.T
+```
+
+**Previous bug**: `_jit_prefill` did not pass `last_indices`, returning logits
+for all `T_pad` tokens. Incorrect for multi-sequence batches.
+
+**Fix**: `last_indices` is now threaded from `_run_prefill` through
+`_jit_prefill` into `LlamaForCausalLM.__call__`.
+
+---
+
+### 3. `seq_lens` Padding Value in Decode
+
+**Previous bug**: padding rows used `val=1`, making them appear to have
+sequence length 1 and potentially attending to position 0 of the KV cache.
+
+**Fix**: `val=0` — padding sequences have no valid context positions, all
+attention logits become `-inf`, softmax output is zero.
+
+---
+
+### 4. Residual Connection Order (Pre-Norm)
+
+**Previous bug**: `attn_out` was passed directly into `post_attention_layernorm`
+via the fused-residual API, bypassing the attention residual add entirely.
+Every layer’s hidden state was just the raw attention output, not `attn + x`.
+
+**Fix**: Explicit pre-norm pattern everywhere:
+```python
+residual = x
+x = self.input_layernorm(x)
+x = self.self_attn(x, ...)
+x = x + residual          # ← residual add after attention
+
+residual = x
+x = self.post_attention_layernorm(x)
+x = self.mlp(x)
+x = x + residual          # ← residual add after MLP
+```
+
+---
+
+### 5. Qwen3 QK-Norm (Architecture-Specific)
+
+Qwen3 applies a **per-head RMSNorm** to Q and K before RoPE:
+```python
+q = self.q_norm(q)   # (T, num_heads, head_dim)
+k = self.k_norm(k)   # (T, num_kv_heads, head_dim)
+q, k = self.rope(q, k, positions)
+```
+Weights: `self_attn.q_norm.weight` and `self_attn.k_norm.weight`, shape `(head_dim,)`.
+
+Without QK-Norm, Q/K magnitudes are uncontrolled from layer 0. Attention scores
+diverge, hidden states explode by layer 2, and all output logits are garbage.
+Symptom: `act_out max` jumps from ~3 to ~95 at layer 2, then collapses to ~0.02
+at layer 3 as RMSNorm tries to compensate.
+
+**Fix**: `PerHeadRMSNorm` class in `layernorm.py`; applied in `LlamaAttention`
+before RoPE. Graceful fallback to identity for plain Llama models (weight stays
+ones when `q_norm.weight` / `k_norm.weight` are absent from checkpoint).
+
+---
+
+### 6. PyTorch → JAX API Reference
+
+| PyTorch | JAX |
+|---------|-----|
+| `tensor.fill_(0)` | `jnp.zeros_like(tensor)` |
+| `tensor[i] = val` (in-place) | `tensor.at[i].set(val)` |
+| `torch.jit.script` | `jax.jit` / `nnx.jit` |
+| `nn.Module` | `nnx.Module` |
+| `tensor.cuda()` | JAX auto-selects device via `jax.devices()` |
+| `torch.no_grad()` | Not needed (JAX is functional; grad opt-in via `jax.grad`) |
+| `model.parameters()` | `nnx.variables(model, nnx.Param)` |
+| `nn.ModuleList` | `nnx.List` (plain `list` raises in Flax NNX pytree mode) |
+| `torch.multinomial` | `jax.random.categorical` |
+| `tensor.cos()` / `.sin()` | `jnp.cos(x)` / `jnp.sin(x)` (no instance methods) |
+| dynamic shape ops | `jax.lax.dynamic_slice` or padding + masking |
+| `torch.cuda.synchronize()` | `jax.effects_barrier()` |
+
+---
+
+### 7. Known Limitations
+
+- **No FlashAttention**: Phase 8 will add `jax.nn.dot_product_attention`.
+- **TP > 1 not tested**: Tensor parallelism compiles for `tp_size=1`; multi-GPU
+  TP requires `jax.lax.psum` allreduce in linear layers (scaffolding exists).
+- **O(log N) recompilations**: Each distinct padded shape triggers XLA recompile.
+  Padding to next-power-of-2 bounds this; persistent compilation cache planned.
+- **No CUDA graphs**: Each call goes through full XLA dispatch. `jax.jit` caches
+  compiled kernels but does not currently use CUDA graph capture.
 
 ---
 
@@ -204,7 +365,7 @@ tests/
 │       ├── test_scheduler.py            # Phase 6 ✅
 │       └── test_llm_engine.py           # Phase 7 ✅
 └── e2e/
-    ├── test_generation.py               # Phase 8 ⬜ (real model)
+    ├── test_generation.py               # Phase 8 ⬜
     └── test_throughput.py               # Phase 8 ⬜
 ```
 
@@ -212,47 +373,6 @@ tests/
 - **Deterministic ops** (layernorm, linear, rope): atol=1e-3, rtol=1e-3
 - **Attention softmax**: atol=1e-2
 - **Sampling** (stochastic): compare distributions, not exact samples
-
----
-
-## Key JAX Migration Patterns
-
-### 1. In-place ops → functional updates
-```python
-# PyTorch
-kv_cache[block_idx, :, :] = new_kv
-# JAX
-kv_cache = kv_cache.at[block_idx].set(new_kv)
-```
-
-### 2. `nn.Module` → `flax.nnx.Module`
-```python
-class RMSNorm(nnx.Module):
-    def __init__(self, dim): self.weight = nnx.Param(jnp.ones(dim))
-    def __call__(self, x): ...
-```
-
-### 3. Dynamic shapes → static shapes with padding
-```python
-# Use padding + masking, or jax.lax.dynamic_slice
-```
-
-### 4. CUDA sync → JAX async dispatch
-```python
-torch.cuda.synchronize()   # PyTorch
-jax.effects_barrier()      # JAX
-```
-
-### 5. Random sampling
-```python
-torch.multinomial(probs, 1)         # PyTorch
-jax.random.categorical(key, logits) # JAX
-```
-
-### 6. Module list → `nnx.List`
-```python
-self.layers = nnx.List([...])  # plain list raises ValueError in Flax NNX Pytree mode
-```
 
 ---
 
@@ -275,24 +395,30 @@ dependencies = [
 
 ## Progress Tracker
 
-| Date | Phase | Module | Commit | Status | Notes |
-|------|-------|--------|--------|--------|-------|
-| 2026-05-27 | 0 | Project scaffold | — | ✅ Done | pyproject, CI, skeleton |
-| 2026-05-27 | 1.1 | Config & SamplingParams | — | ✅ Done | assert-based validation |
-| 2026-05-27 | 1.2 | Activation | — | ✅ Done | atol=1e-5 |
-| 2026-05-27 | 1.3 | RMSNorm | — | ✅ Done | fused add+norm |
-| 2026-05-27 | 1.4 | RoPE | — | ✅ Done | LRU cache, jit |
-| 2026-05-27 | 1 | Bug fixes (RoPE+Norm) | `a930b22` | ✅ Done | jnp.cos/sin; dtype cast |
-| 2026-05-27 | 2 | Linear + Embed/LMHead | — | ✅ Done | TP sharding, weight tying |
-| 2026-05-27 | 3 | PagedKVCache + Attention + Sampler | `cb5f06b` | ✅ Done | prefill/decode/GQA |
-| 2026-05-27 | 3 | Bug fix (test index) | `403d934` | ✅ Done | `k_out[seq,pos,head,:]` |
-| 2026-05-27 | 4 | LLaMA model stack | `cd3e901` | ✅ Done | full MLP/Attn/Decoder |
-| 2026-05-27 | 4 | Bug fix (nnx.List) | `895286d` | ✅ Done | `nnx.List`; residual test |
-| 2026-05-27 | 5 | HF Loader + Registry | `7caae14` | ✅ Done | safetensors/bin shards |
-| 2026-05-27 | 6 | Engine skeleton | — | ✅ Done | sequence/block/sched/runner |
-| 2026-05-27 | 6 | Bug fix (EngineConfig flat) | `e0bc16c` | ✅ Done | flat fields + max_num_batched_tokens |
-| 2026-05-27 | 6 | Bug fix (SamplingParams assert) | `2f269d3` | ✅ Done | assert not ValueError; stop_token_ids |
-| 2026-05-28 | 7 | LLMEngine + LLM API | *(this commit)* | ✅ Done | generate_all, RequestOutput, 9 tests |
+| Date | Phase | Module | Commit | Notes |
+|------|-------|--------|--------|-------|
+| 2026-05-27 | 0 | Project scaffold | — | pyproject, CI, skeleton |
+| 2026-05-27 | 1.1 | Config & SamplingParams | — | assert-based validation |
+| 2026-05-27 | 1.2 | Activation | — | atol=1e-5 |
+| 2026-05-27 | 1.3 | RMSNorm | — | fused add+norm |
+| 2026-05-27 | 1.4 | RoPE | — | LRU cache, jit |
+| 2026-05-27 | 1 | Bug fix: RoPE+Norm | `a930b22` | jnp.cos/sin; dtype cast |
+| 2026-05-27 | 2 | Linear + Embed/LMHead | — | TP sharding, weight tying |
+| 2026-05-27 | 3 | PagedKVCache + Attention + Sampler | `cb5f06b` | prefill/decode/GQA |
+| 2026-05-27 | 3 | Bug fix: test index | `403d934` | `k_out[seq,pos,head,:]` |
+| 2026-05-27 | 4 | LLaMA model stack | `cd3e901` | full MLP/Attn/Decoder |
+| 2026-05-27 | 4 | Bug fix: nnx.List | `895286d` | `nnx.List`; residual test |
+| 2026-05-27 | 5 | HF Loader + Registry | `7caae14` | safetensors/bin shards |
+| 2026-05-27 | 6 | Engine skeleton | — | sequence/block/sched/runner |
+| 2026-05-27 | 6 | Bug fix: EngineConfig flat | `e0bc16c` | flat fields + max_num_batched_tokens |
+| 2026-05-27 | 6 | Bug fix: SamplingParams assert | `2f269d3` | assert not ValueError; stop_token_ids |
+| 2026-05-28 | 7 | LLMEngine + LLM API | — | generate_all, RequestOutput, 9 tests |
+| 2026-05-28 | 7 | Bug fix: residual connections | — | explicit pre-norm residual pattern |
+| 2026-05-28 | 7 | Bug fix: nnx.jit KV cache | — | jax.jit → nnx.jit in model_runner |
+| 2026-05-28 | 7 | Bug fix: last_indices prefill | — | lm_head returns [num_seqs, vocab] |
+| 2026-05-28 | 7 | Bug fix: seq_lens pad val=0 | — | prevent phantom context in decode |
+| 2026-05-28 | 4 | Bug fix: Qwen3 QK-Norm | `7378e74` | PerHeadRMSNorm; q/k norm before RoPE |
+| 2026-05-28 | 7 | GPU demo: multi-QA showcase | `221ff38` | 10 Q&A, timing, Qwen3-0.6B verified ✅ |
 
 ---
 
@@ -303,3 +429,4 @@ dependencies = [
 - [Flash Attention in JAX](https://jax.readthedocs.io/en/latest/_autosummary/jax.nn.dot_product_attention.html)
 - [Original nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)
 - [chex testing library](https://github.com/google-deepmind/chex)
+- [Qwen3 HuggingFace Model](https://huggingface.co/Qwen/Qwen3-0.6B)
