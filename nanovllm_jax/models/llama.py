@@ -1,6 +1,6 @@
-"""Llama model (JAX port of nanovllm/models/llama.py).
+"""Llama / Qwen3 model (JAX port of nanovllm/models/llama.py).
 
-Status: ✅ Fixed (residual connections, tie_word_embeddings)
+Status: ✅ Fixed (residual connections, tie_word_embeddings, QK-Norm)
 
 Residual connection design (Pre-Norm)
 --------------------------------------
@@ -13,18 +13,23 @@ Standard Pre-Norm transformer block:
     x = rms_norm2(x)          # normalise only
     x = mlp(x) + residual     # add residual after MLP
 
-Previous bug: attn_out was passed directly into post_attention_layernorm
-via the fused-residual API, bypassing the attention residual add entirely.
-This broke the residual stream across every layer, producing garbage logits.
-
-Fix: use RMSNorm without the fused-residual path in the decoder layer;
-manage residuals explicitly so the flow is always clear and correct.
-
 Weight tying design
 -------------------
 When tie_word_embeddings=True, load_weights() copies embed_tokens weights
-into lm_head.weight at load time. lm_head.__call__ always reads its own
-nnx.Param — no JIT-boundary / abstract-tracer issues.
+into lm_head.weight at load time.
+
+Qwen3 QK-Norm
+-------------
+Qwen3 applies a per-head RMSNorm to Q and K *before* RoPE:
+    q = q_norm(q)   # (T, num_heads,    head_dim)
+    k = k_norm(k)   # (T, num_kv_heads, head_dim)
+    q, k = rope(q, k, positions)
+
+Weights: self_attn.q_norm.weight  (head_dim,)
+         self_attn.k_norm.weight  (head_dim,)
+
+For models without QK-Norm these weights are absent; load_weights() falls
+back to identity (weight=ones) so the same code works for plain Llama.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -36,7 +41,7 @@ from flax import nnx
 from nanovllm_jax.layers.activation import SiluAndMul
 from nanovllm_jax.layers.attention import Attention, PagedKVCache
 from nanovllm_jax.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
-from nanovllm_jax.layers.layernorm import RMSNorm
+from nanovllm_jax.layers.layernorm import RMSNorm, PerHeadRMSNorm
 from nanovllm_jax.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -123,6 +128,10 @@ class LlamaAttention(nnx.Module):
             config.hidden_size,
             tp_size=tp, tp_rank=tr,
         )
+        # Qwen3 per-head QK-Norm (identity for plain Llama — weight stays ones)
+        self.q_norm = PerHeadRMSNorm(config.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = PerHeadRMSNorm(config.head_dim, eps=config.rms_norm_eps)
+
         self.rope = RotaryEmbedding(
             head_dim=config.head_dim,
             max_seq_len=config.max_position_embeddings,
@@ -156,6 +165,9 @@ class LlamaAttention(nnx.Module):
         q = qkv[:, :local_q * hd].reshape(T, local_q, hd)
         k = qkv[:, local_q * hd: (local_q + local_kv) * hd].reshape(T, local_kv, hd)
         v = qkv[:, (local_q + local_kv) * hd:].reshape(T, local_kv, hd)
+        # Qwen3 QK-Norm: applied per-head before RoPE
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         q, k = self.rope(q, k, positions)
         out = self.attn(
             q, k, v, kv_cache,
@@ -172,6 +184,11 @@ class LlamaAttention(nnx.Module):
         self.qkv_proj.load_weight(jnp.array(params["k_proj.weight"]), shard_id="k")
         self.qkv_proj.load_weight(jnp.array(params["v_proj.weight"]), shard_id="v")
         self.o_proj.load_weight(jnp.array(params["o_proj.weight"]))
+        # QK-Norm weights (present in Qwen3; absent in plain Llama -> keep ones)
+        if "q_norm.weight" in params:
+            self.q_norm.weight = nnx.Param(jnp.array(params["q_norm.weight"]))
+        if "k_norm.weight" in params:
+            self.k_norm.weight = nnx.Param(jnp.array(params["k_norm.weight"]))
 
 
 # ---------------------------------------------------------------------------
@@ -199,9 +216,8 @@ class LlamaDecoderLayer(nnx.Module):
         num_real_seqs: Optional[int] = None,
     ) -> jax.Array:
         # --- Pre-Norm attention block ---
-        # residual add happens AFTER attention, not inside the norm call
         residual = x
-        x = self.input_layernorm(x)           # normalise only (no residual arg)
+        x = self.input_layernorm(x)
         x = self.self_attn(
             x, positions, kv_cache,
             block_indices, block_offsets, seq_lens,
@@ -209,13 +225,13 @@ class LlamaDecoderLayer(nnx.Module):
             num_real_tokens=num_real_tokens,
             num_real_seqs=num_real_seqs,
         )
-        x = x + residual                       # residual add after attention
+        x = x + residual
 
         # --- Pre-Norm MLP block ---
         residual = x
-        x = self.post_attention_layernorm(x)  # normalise only
+        x = self.post_attention_layernorm(x)
         x = self.mlp(x)
-        x = x + residual                       # residual add after MLP
+        x = x + residual
         return x
 
     def load_weights(self, params: dict) -> None:
