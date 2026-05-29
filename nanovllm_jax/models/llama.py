@@ -1,6 +1,18 @@
 """Llama model (JAX port of nanovllm/models/llama.py).
 
-Status: ✅ Fixed (last_indices forwarded correctly; tied-weight via weight_override)
+Status: ✅ Fixed (tie_word_embeddings via weight copy at load time)
+
+Weight tying design
+-------------------
+Previous approach passed embed_tokens.weight_array as a ``weight_override``
+argument into lm_head.__call__ inside nnx.jit.  Under JIT tracing the
+property read returns an abstract tracer, not concrete weights, so lm_head
+was computing x @ zeros.T every single call — producing garbage logits.
+
+Fix: when tie_word_embeddings=True, copy embed_tokens weights into
+lm_head.weight at load_weights() time.  lm_head.__call__ always reads
+self.effective_weight (its own nnx.Param).  No JIT-boundary issues,
+no shared graph nodes, no abstract tracer problems.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -287,19 +299,10 @@ class LlamaForCausalLM(nnx.Module):
             num_real_tokens=num_real_tokens,
             num_real_seqs=num_real_seqs,
         )
-        # For tied-weight models (e.g. Qwen3), pass embed_tokens weight as a
-        # plain Array argument to avoid NNX graph-node aliasing under nnx.jit.
-        # JIT sees this as a regular input, not a shared module reference.
-        weight_override = (
-            self.model.embed_tokens.weight_array
-            if self.config.tie_word_embeddings
-            else None
-        )
-        return self.lm_head(
-            hidden,
-            last_indices=last_indices,
-            weight_override=weight_override,
-        )
+        # lm_head always uses self.effective_weight (its own nnx.Param).
+        # For tie_word_embeddings=True, load_weights() already copied
+        # embed_tokens weights into lm_head.weight — no JIT-boundary issues.
+        return self.lm_head(hidden, last_indices=last_indices)
 
     def sample(
         self,
@@ -318,5 +321,14 @@ class LlamaForCausalLM(nnx.Module):
             for k, v in params.items() if k.startswith("model.")
         }
         self.model.load_weights(model_params)
-        if not self.config.tie_word_embeddings and "lm_head.weight" in params:
+
+        if self.config.tie_word_embeddings:
+            # Copy embed_tokens weights directly into lm_head at load time.
+            # This avoids passing embed_tokens.weight_array as a runtime arg
+            # inside nnx.jit where it becomes an abstract tracer (not real weights).
+            embed_w = self.model.embed_tokens.weight_array
+            self.lm_head.load_weight(embed_w)
+            print(f"[WEIGHT] tie_word_embeddings: copied embed_tokens -> lm_head "
+                  f"(norm={float(jnp.linalg.norm(embed_w)):.4f})")
+        elif "lm_head.weight" in params:
             self.lm_head.load_weight(jnp.array(params["lm_head.weight"]))

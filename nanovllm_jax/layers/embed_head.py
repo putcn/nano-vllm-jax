@@ -1,33 +1,19 @@
-"""Token embedding and LM head (JAX port of nanovllm/layers/embed_head.py).
+"""Token embedding 和 LM head（JAX port of nanovllm/layers/embed_head.py）.
 
-Status: ✅ Fixed (weight tying via explicit weight_override — no cross-module refs)
+Status: ✅ Fixed
 
 Weight tying design
 -------------------
-Previous approaches stored a reference to VocabParallelEmbedding inside
-ParallelLMHead (via nnx.data or object.__setattr__).  Both caused nnx.jit
-to detect the same Param appearing in two graph nodes at different trace
-levels:
+lm_head 始终使用自身的 self.weight (nnx.Param)。
+当 tie_word_embeddings=True 时，LlamaForCausalLM.load_weights() 在加载阶段
+直接把 embed_tokens.weight_array 复制到 lm_head.weight。
+这样 __call__ 里永远只有一个代码路径，不存在 JIT abstract tracer 问题。
 
-  ValueError: Cannot extract graph node from different trace level
-
-The correct solution: ParallelLMHead holds NO reference to embed_tokens.
-Instead, LlamaForCausalLM.__call__ passes embed_tokens.weight_array as an
-explicit ``weight_override`` argument when tie_word_embeddings=True.  From
-JAX/NNX's perspective this is just a plain Array argument — no shared nodes,
-no trace level conflict.
-
-``effective_weight`` is kept as a public property so that unit tests
-(test_prefill_last_indices) can access the module's own weight directly
-for reference computations.  It always returns this module's own weight;
-the tied-embed weight is delivered exclusively via ``weight_override``.
-
-_param_array priority
----------------------
-nnx.Variable stores its concrete value in the ``.value`` attribute.
-Using ``get_value()`` or ``param[...]`` can return a lazy/sharded view
-in some Flax NNX versions, producing garbage logits.  Always read
-``.value`` first.
+_param_array 优先级
+-------------------
+1. param.value   — nnx.Variable 标准存储字段（所有版本）
+2. get_value()   — Flax >= 0.10 备用
+3. param[...]    — 最后 fallback
 """
 from __future__ import annotations
 from typing import Optional
@@ -37,13 +23,7 @@ from flax import nnx
 
 
 def _param_array(param: nnx.Param) -> jax.Array:
-    """Extract a plain jax.Array from an nnx.Param.
-
-    Priority:
-      1. param.value   — canonical nnx.Variable storage field (all versions)
-      2. get_value()   — Flax >= 0.10 alternative
-      3. param[...]    — fallback __getitem__
-    """
+    """Extract a plain jax.Array from an nnx.Param."""
     if hasattr(param, 'value'):
         return jnp.asarray(param.value)
     if hasattr(param, 'get_value'):
@@ -72,15 +52,12 @@ class VocabParallelEmbedding(nnx.Module):
     def load_weight(self, weight: jax.Array) -> None:
         arr = jnp.asarray(weight[self.vocab_start_idx:self.vocab_end_idx, :])
         self.weight = nnx.Param(arr)
-        # Sanity: freshly loaded weights must not be all-zeros
         assert float(jnp.abs(arr).max()) > 0, (
-            f"VocabParallelEmbedding.load_weight: loaded weight is all-zeros "
-            f"(shape={arr.shape}). Check weight key mapping."
+            f"VocabParallelEmbedding.load_weight: 全零权重 shape={arr.shape}"
         )
 
     @property
     def weight_array(self) -> jax.Array:
-        """Return the underlying weight as a plain jax.Array."""
         return _param_array(self.weight)
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -109,43 +86,25 @@ class ParallelLMHead(nnx.Module):
         self.weight = nnx.Param(jnp.zeros((self.num_embeddings_per_partition, embedding_dim)))
 
     def load_weight(self, weight: jax.Array) -> None:
+        """weight shape: (full_vocab, hidden) — 自动按 tp_rank 切片."""
         start = self.tp_rank * self.num_embeddings_per_partition
-        end = start + self.num_embeddings_per_partition
+        end   = start + self.num_embeddings_per_partition
         arr = jnp.asarray(weight[start:end, :])
         self.weight = nnx.Param(arr)
         assert float(jnp.abs(arr).max()) > 0, (
-            f"ParallelLMHead.load_weight: loaded weight is all-zeros "
-            f"(shape={arr.shape}). Check weight key mapping."
+            f"ParallelLMHead.load_weight: 全零权重 shape={arr.shape}"
         )
 
     @property
     def effective_weight(self) -> jax.Array:
-        """Return this module's own weight as a plain jax.Array.
-
-        For tied-weight models the actual weight used at inference time is
-        delivered via the ``weight_override`` argument to ``__call__`` by
-        LlamaForCausalLM.  This property exposes the module-local weight so
-        that unit tests can use it as a numerical reference.
-        """
+        """Return this module's own weight as a plain jax.Array."""
         return _param_array(self.weight)
 
     def __call__(
         self,
         x: jax.Array,
         last_indices: Optional[jax.Array] = None,
-        weight_override: Optional[jax.Array] = None,
     ) -> jax.Array:
-        """Compute logits.
-
-        Args:
-            x: hidden states, shape [T, hidden_size]
-            last_indices: if provided, select x[last_indices] before matmul.
-            weight_override: if provided (tied-weight models), use this array
-                instead of self.weight.  LlamaForCausalLM passes
-                embed_tokens.weight_array here so JIT sees a plain Array
-                argument — no shared-node trace-level conflict.
-        """
         if last_indices is not None:
             x = x[last_indices]
-        w = weight_override if weight_override is not None else self.effective_weight
-        return x @ w.T
+        return x @ self.effective_weight.T
