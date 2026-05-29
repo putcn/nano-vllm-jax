@@ -1,18 +1,30 @@
 """Llama model (JAX port of nanovllm/models/llama.py).
 
-Status: ✅ Fixed (tie_word_embeddings via weight copy at load time)
+Status: ✅ Fixed (residual connections, tie_word_embeddings)
+
+Residual connection design (Pre-Norm)
+--------------------------------------
+Standard Pre-Norm transformer block:
+
+    residual = x
+    x = rms_norm1(x)          # normalise only
+    x = attn(x) + residual    # add residual after attention
+    residual = x
+    x = rms_norm2(x)          # normalise only
+    x = mlp(x) + residual     # add residual after MLP
+
+Previous bug: attn_out was passed directly into post_attention_layernorm
+via the fused-residual API, bypassing the attention residual add entirely.
+This broke the residual stream across every layer, producing garbage logits.
+
+Fix: use RMSNorm without the fused-residual path in the decoder layer;
+manage residuals explicitly so the flow is always clear and correct.
 
 Weight tying design
 -------------------
-Previous approach passed embed_tokens.weight_array as a ``weight_override``
-argument into lm_head.__call__ inside nnx.jit.  Under JIT tracing the
-property read returns an abstract tracer, not concrete weights, so lm_head
-was computing x @ zeros.T every single call — producing garbage logits.
-
-Fix: when tie_word_embeddings=True, copy embed_tokens weights into
-lm_head.weight at load_weights() time.  lm_head.__call__ always reads
-self.effective_weight (its own nnx.Param).  No JIT-boundary issues,
-no shared graph nodes, no abstract tracer problems.
+When tie_word_embeddings=True, load_weights() copies embed_tokens weights
+into lm_head.weight at load time. lm_head.__call__ always reads its own
+nnx.Param — no JIT-boundary / abstract-tracer issues.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -186,17 +198,25 @@ class LlamaDecoderLayer(nnx.Module):
         num_real_tokens: Optional[int] = None,
         num_real_seqs: Optional[int] = None,
     ) -> jax.Array:
-        normed, residual = self.input_layernorm(x, residual=jnp.zeros_like(x))
-        attn_out = self.self_attn(
-            normed, positions, kv_cache,
+        # --- Pre-Norm attention block ---
+        # residual add happens AFTER attention, not inside the norm call
+        residual = x
+        x = self.input_layernorm(x)           # normalise only (no residual arg)
+        x = self.self_attn(
+            x, positions, kv_cache,
             block_indices, block_offsets, seq_lens,
             is_prefill, block_table,
             num_real_tokens=num_real_tokens,
             num_real_seqs=num_real_seqs,
         )
-        normed2, residual2 = self.post_attention_layernorm(attn_out, residual=residual)
-        mlp_out = self.mlp(normed2)
-        return mlp_out + residual2
+        x = x + residual                       # residual add after attention
+
+        # --- Pre-Norm MLP block ---
+        residual = x
+        x = self.post_attention_layernorm(x)  # normalise only
+        x = self.mlp(x)
+        x = x + residual                       # residual add after MLP
+        return x
 
     def load_weights(self, params: dict) -> None:
         self.input_layernorm.weight = nnx.Param(
@@ -299,9 +319,6 @@ class LlamaForCausalLM(nnx.Module):
             num_real_tokens=num_real_tokens,
             num_real_seqs=num_real_seqs,
         )
-        # lm_head always uses self.effective_weight (its own nnx.Param).
-        # For tie_word_embeddings=True, load_weights() already copied
-        # embed_tokens weights into lm_head.weight — no JIT-boundary issues.
         return self.lm_head(hidden, last_indices=last_indices)
 
     def sample(
@@ -323,9 +340,6 @@ class LlamaForCausalLM(nnx.Module):
         self.model.load_weights(model_params)
 
         if self.config.tie_word_embeddings:
-            # Copy embed_tokens weights directly into lm_head at load time.
-            # This avoids passing embed_tokens.weight_array as a runtime arg
-            # inside nnx.jit where it becomes an abstract tracer (not real weights).
             embed_w = self.model.embed_tokens.weight_array
             self.lm_head.load_weight(embed_w)
             print(f"[WEIGHT] tie_word_embeddings: copied embed_tokens -> lm_head "

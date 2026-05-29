@@ -46,9 +46,14 @@ from flax import nnx
 
 def _get_variable(v):
     """Compatibility shim: get array from nnx.Variable regardless of Flax version."""
+    # Variable[Array]: use bracket indexing (preferred, per Flax deprecation notice)
+    try:
+        return v[...]
+    except Exception:
+        pass
     if hasattr(v, 'get_value'):
         return v.get_value()
-    return v.value  # fallback for older Flax
+    return v.value  # last resort fallback
 
 
 def _make_batched_causal_mask(seq_lens: jax.Array, T: int) -> jax.Array:
@@ -68,16 +73,10 @@ def _make_batched_causal_mask(seq_lens: jax.Array, T: int) -> jax.Array:
     Returns:
         mask: (T, T) bool array.
     """
-    # Build a per-token sequence-id array, e.g. [0,0,0,1,1,2,2,2,2]
     num_seqs = seq_lens.shape[0]
     seq_id = jnp.repeat(jnp.arange(num_seqs, dtype=jnp.int32), seq_lens, total_repeat_length=T)
-
-    # same_seq[i, j] = (seq_id[i] == seq_id[j])
     same_seq = seq_id[:, None] == seq_id[None, :]  # (T, T)
-
-    # causal[i, j] = (j <= i)
     causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
-
     return same_seq & causal
 
 
@@ -183,11 +182,6 @@ class Attention(nnx.Module):
         v: jax.Array,
         seq_lens: jax.Array,
     ) -> jax.Array:
-        """Prefill attention with correct per-sequence causal masking.
-
-        Uses a block-diagonal causal mask so tokens in different sequences
-        cannot attend to each other, even when packed into a single flat buffer.
-        """
         T = q.shape[0]
         if self.kv_groups > 1:
             k = jnp.repeat(k, self.kv_groups, axis=1)
@@ -197,7 +191,6 @@ class Attention(nnx.Module):
         k_t = jnp.transpose(k, (1, 2, 0))  # (H, D, T)
         logits = jnp.matmul(q_t, k_t) * self.scale  # (H, T, T)
 
-        # Block-diagonal causal mask: prevents cross-sequence attention.
         mask = _make_batched_causal_mask(seq_lens, T)  # (T, T) bool
         logits = jnp.where(mask[None, :, :], logits, jnp.finfo(jnp.float32).min)
 

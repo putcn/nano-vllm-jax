@@ -4,7 +4,7 @@ set -euo pipefail
 
 MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
 MODEL_PATH="${MODEL_PATH:-}"
-MAX_TOKENS="${MAX_TOKENS:-128}"
+MAX_TOKENS="${MAX_TOKENS:-64}"
 NUM_BLOCKS="${NUM_BLOCKS:-512}"
 GPU_ID="${GPU_ID:-all}"
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
@@ -17,8 +17,6 @@ echo "    GPU        : $GPU_ID"
 echo "    HF cache   : $HF_CACHE"
 echo ""
 
-# 利用 Docker 层缓存：不加 --no-cache，依赖层在未变更时直接复用
-# 只有源代码变更时才需重建最后的 COPY + pip install 层
 docker build --progress=plain -f docker/Dockerfile.gpu -t nano-vllm-jax:gpu .
 
 if [ "$GPU_ID" = "all" ]; then
@@ -40,7 +38,7 @@ docker run --rm -i $GPU_FLAG \
   -w /workspace \
   nano-vllm-jax:gpu \
   python - <<'PYEOF'
-import os, pathlib
+import os, pathlib, math
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -49,8 +47,9 @@ print(f"JAX devices: {jax.devices()}")
 
 model_id   = os.environ["MODEL"]
 model_path = os.environ.get("MODEL_PATH", "").strip()
-max_tokens = int(os.environ.get("MAX_TOKENS", 128))
+max_tokens = int(os.environ.get("MAX_TOKENS", 64))
 num_blocks = int(os.environ.get("NUM_BLOCKS", 512))
+block_size = 16
 
 from huggingface_hub import snapshot_download
 if model_path and pathlib.Path(model_path).exists():
@@ -80,13 +79,16 @@ print(f"\n[DEBUG] 模型配置:")
 print(f"  vocab_size         = {mc.vocab_size}")
 print(f"  tie_word_embeddings= {mc.tie_word_embeddings}")
 print(f"  hidden_size        = {mc.hidden_size}")
+print(f"  num_hidden_layers  = {mc.num_hidden_layers}")
+print(f"  num_kv_heads       = {mc.num_key_value_heads}")
+print(f"  head_dim           = {mc.head_dim}")
 
 # 权重绑定诊断
 print("\n[DIAG] === 权重绑定检查 ===")
 embed_w = np.array(model.model.embed_tokens.weight_array, dtype=np.float32)
-print(f"  embed_tokens  shape={embed_w.shape}  norm={np.linalg.norm(embed_w):.4f}  is_zero={np.abs(embed_w).max()==0}")
+print(f"  embed_tokens  shape={embed_w.shape}  norm={np.linalg.norm(embed_w):.4f}")
 lmh_w = np.array(model.lm_head.effective_weight, dtype=np.float32)
-print(f"  lm_head       shape={lmh_w.shape}  norm={np.linalg.norm(lmh_w):.4f}  is_zero={np.abs(lmh_w).max()==0}")
+print(f"  lm_head       shape={lmh_w.shape}  norm={np.linalg.norm(lmh_w):.4f}")
 if mc.tie_word_embeddings:
     ok = np.allclose(embed_w, lmh_w, atol=1e-4)
     print(f"  tied weights match: {ok}" + ("" if ok else f"  !! max_diff={np.abs(embed_w-lmh_w).max():.6f}"))
@@ -96,10 +98,10 @@ kv_cache = PagedKVCache(
     num_kv_heads=mc.num_key_value_heads,
     head_dim=mc.head_dim,
     num_blocks=num_blocks,
-    block_size=16,
+    block_size=block_size,
     dtype=jnp.bfloat16,
 )
-block_manager = BlockManager(num_blocks=num_blocks, block_size=16)
+block_manager = BlockManager(num_blocks=num_blocks, block_size=block_size)
 
 raw_question = "What is the capital of France? Answer in one word."
 messages = [{"role": "user", "content": raw_question}]
@@ -116,18 +118,30 @@ except TypeError:
     )
 
 input_ids = tok.encode(prompt, add_special_tokens=False)
+T = len(input_ids)
 print(f"\n[DEBUG] Question : {raw_question!r}")
-print(f"[DEBUG] Token IDs ({len(input_ids)}): {input_ids}")
+print(f"[DEBUG] Prompt tokens ({T}): {input_ids}")
+print(f"[DEBUG] Prompt text : {prompt!r}")
+
+# Pre-allocate enough blocks for prompt + max_tokens
+total_tokens_needed = T + max_tokens
+blocks_needed = math.ceil(total_tokens_needed / block_size)
+print(f"\n[DEBUG] Pre-allocating {blocks_needed} blocks for {total_tokens_needed} tokens")
 
 seq = Sequence(seq_id=0, prompt_token_ids=input_ids,
                sampling_params=SamplingParams(temperature=0.0, max_tokens=max_tokens))
-block_manager.allocate(seq)
 
-T = len(input_ids)
+# Allocate all blocks upfront to avoid IndexError during decode
+for _ in range(blocks_needed):
+    block_manager.allocate(seq)
+
+print(f"[DEBUG] block_table length: {len(seq.block_table)}")
+
+# ---- Prefill ----
 all_ids = jnp.array(input_ids, dtype=jnp.int32)
 all_pos = jnp.arange(T, dtype=jnp.int32)
-all_bi  = jnp.array([seq.block_table[i // 16] for i in range(T)], dtype=jnp.int32)
-all_bo  = jnp.array([i % 16 for i in range(T)], dtype=jnp.int32)
+all_bi  = jnp.array([seq.block_table[i // block_size] for i in range(T)], dtype=jnp.int32)
+all_bo  = jnp.array([i % block_size for i in range(T)], dtype=jnp.int32)
 seq_lens    = jnp.array([T], dtype=jnp.int32)
 last_indices = jnp.array([T - 1], dtype=jnp.int32)
 
@@ -137,30 +151,45 @@ def pad1d(a, n, v=0):
 if T_pad != T:
     all_ids = pad1d(all_ids, T_pad)
     all_pos = pad1d(all_pos, T_pad)
-    all_bi  = pad1d(all_bi, T_pad)
-    all_bo  = pad1d(all_bo, T_pad)
+    all_bi  = pad1d(all_bi,  T_pad)
+    all_bo  = pad1d(all_bo,  T_pad)
 
+print(f"\n[DEBUG] Prefill: T_real={T}, T_pad={T_pad}")
 logits = _jit_prefill(
     model, kv_cache,
     all_ids, all_pos, all_bi, all_bo, seq_lens, last_indices,
     num_real_tokens=T,
 )
 logits_np = np.array(logits, dtype=np.float32)
-print(f"\n[DEBUG] Prefill logits: min={logits_np[0].min():.4f}  max={logits_np[0].max():.4f}")
-top5 = np.argsort(logits_np[0])[::-1][:5]
-print(f"  Top-5: {[tok.decode([i]) for i in top5]}")
+print(f"[DEBUG] Prefill logits shape: {logits_np.shape}")
+print(f"[DEBUG] Prefill logits: min={logits_np[0].min():.4f}  max={logits_np[0].max():.4f}")
+top5_ids = np.argsort(logits_np[0])[::-1][:5]
+print(f"  Top-5 ids  : {top5_ids.tolist()}")
+print(f"  Top-5 text : {[tok.decode([i]) for i in top5_ids]}")
+print(f"  Top-5 logit: {logits_np[0][top5_ids].tolist()}")
 
 argmax_token = int(np.argmax(logits_np[0]))
 print(f"\n[DEBUG] Prefill argmax: id={argmax_token}  text={tok.decode([argmax_token])!r}")
 
-print(f"\n[DEBUG] ===== Decode 前10步 =====")
+# ---- Decode ----
+print(f"\n[DEBUG] ===== Decode {max_tokens} steps =====")
 seq.append_token(argmax_token)
-for step_i in range(10):
+generated = [argmax_token]
+
+for step_i in range(max_tokens - 1):
     step = seq.total_len - 1
+    blk_num = step // block_size
+    blk_off = step % block_size
+
+    # Safety check: should never happen since we pre-allocated
+    if blk_num >= len(seq.block_table):
+        print(f"  [WARN] step {step}: blk_num={blk_num} >= block_table len {len(seq.block_table)}, stopping")
+        break
+
     dec_ids  = jnp.array([seq.last_token_id], dtype=jnp.int32)
     dec_pos  = jnp.array([step], dtype=jnp.int32)
-    dec_bi   = jnp.array([seq.block_table[step // 16]], dtype=jnp.int32)
-    dec_bo   = jnp.array([step % 16], dtype=jnp.int32)
+    dec_bi   = jnp.array([seq.block_table[blk_num]], dtype=jnp.int32)
+    dec_bo   = jnp.array([blk_off], dtype=jnp.int32)
     dec_lens = jnp.array([seq.total_len], dtype=jnp.int32)
     dec_bt   = jnp.array([list(seq.block_table)], dtype=jnp.int32)
     dec_logits = _jit_decode(
@@ -170,10 +199,16 @@ for step_i in range(10):
     )
     dec_np = np.array(dec_logits, dtype=np.float32)
     next_tok = int(np.argmax(dec_np[0]))
-    print(f"  step {step_i+1}: {tok.decode([seq.last_token_id])!r} -> {tok.decode([next_tok])!r}")
+    print(f"  step {step_i+1:3d}: {tok.decode([seq.last_token_id])!r} -> {tok.decode([next_tok])!r}  (id={next_tok})")
     seq.append_token(next_tok)
+    generated.append(next_tok)
     if next_tok == tok.eos_token_id:
+        print("  [EOS reached]")
         break
 
-print(f"\n[DEBUG] 生成结果: {tok.decode(seq.all_token_ids[T:])!r}")
+full_response = tok.decode(generated, skip_special_tokens=True)
+print(f"\n{'='*60}")
+print(f"Q: {raw_question}")
+print(f"A: {full_response}")
+print(f"{'='*60}")
 PYEOF
