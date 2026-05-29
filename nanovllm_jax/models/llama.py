@@ -1,6 +1,6 @@
 """Llama model (JAX port of nanovllm/models/llama.py).
 
-Status: ✅ Fixed (last_indices forwarded correctly through LlamaForCausalLM)
+Status: ✅ Fixed (last_indices forwarded correctly; tied-weight via weight_override)
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -264,8 +264,6 @@ class LlamaForCausalLM(nnx.Module):
             config.vocab_size, config.hidden_size,
             tp_size=config.tp_size, tp_rank=config.tp_rank,
         )
-        if config.tie_word_embeddings:
-            self.lm_head.tie_weights(self.model.embed_tokens)
         self.sampler = Sampler()
 
     def __call__(
@@ -289,11 +287,19 @@ class LlamaForCausalLM(nnx.Module):
             num_real_tokens=num_real_tokens,
             num_real_seqs=num_real_seqs,
         )
-        # last_indices: during prefill, select only the last real token per
-        # sequence so lm_head returns shape [num_seqs, vocab] rather than
-        # [T_pad, vocab].  During decode, last_indices=None is correct because
-        # each row in hidden already corresponds to one sequence's single token.
-        return self.lm_head(hidden, last_indices=last_indices)
+        # For tied-weight models (e.g. Qwen3), pass embed_tokens weight as a
+        # plain Array argument to avoid NNX graph-node aliasing under nnx.jit.
+        # JIT sees this as a regular input, not a shared module reference.
+        weight_override = (
+            self.model.embed_tokens.weight_array
+            if self.config.tie_word_embeddings
+            else None
+        )
+        return self.lm_head(
+            hidden,
+            last_indices=last_indices,
+            weight_override=weight_override,
+        )
 
     def sample(
         self,

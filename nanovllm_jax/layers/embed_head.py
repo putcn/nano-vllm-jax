@@ -1,23 +1,20 @@
 """Token embedding and LM head (JAX port of nanovllm/layers/embed_head.py).
 
-Status: ✅ Fixed (weight tying via object.__setattr__ bypass)
+Status: ✅ Fixed (weight tying via explicit weight_override — no cross-module refs)
 
 Weight tying design
 -------------------
-Flax NNX's Pytree machinery enforces strict type consistency on Module
-attributes: a slot initialised as ``None`` (static) cannot later be assigned
-a Module instance (data).  The ``nnx.data()`` wrapper is the official fix,
-but unwrapping it reliably across Flax versions is fragile — ``.value``,
-``.raw_value``, and ``.get_raw_value()`` all have deprecation or availability
-issues depending on the exact Flax release.
+Previous approaches stored a reference to VocabParallelEmbedding inside
+ParallelLMHead (via nnx.data or object.__setattr__).  Both caused nnx.jit to
+detect the same Param appearing in two graph nodes at different trace levels:
 
-Instead we bypass the NNX Pytree type system entirely by storing the tied
-embedding reference with ``object.__setattr__``.  This is a well-known Python
-pattern for injecting attributes that should be invisible to a class's
-``__setattr__`` override.  NNX's Pytree traversal only sees attributes that
-were set through its own ``__setattr__``, so ``_tied_embed_ref`` is simply
-skipped during tracing — which is exactly what we want: the reference is a
-pure Python pointer, not a JAX parameter.
+  ValueError: Cannot extract graph node from different trace level
+
+The correct solution: ParallelLMHead holds NO reference to embed_tokens.
+Instead, LlamaForCausalLM.__call__ passes embed_tokens.weight_array as an
+explicit ``weight_override`` argument when tie_word_embeddings=True.  From
+JAX/NNX's perspective this is just a plain Array argument — no shared nodes,
+no trace level conflict.
 """
 from __future__ import annotations
 from typing import Optional
@@ -89,18 +86,6 @@ class ParallelLMHead(nnx.Module):
         self.tp_rank = tp_rank
         self.num_embeddings_per_partition = num_embeddings // tp_size
         self.weight = nnx.Param(jnp.zeros((self.num_embeddings_per_partition, embedding_dim)))
-        # Initialise the bypass slot via object.__setattr__ so NNX Pytree
-        # machinery never sees it.  Must be set here (not skipped) so that
-        # object.__getattribute__ always finds it even before tie_weights().
-        object.__setattr__(self, '_tied_embed_ref', None)
-
-    def tie_weights(self, embed: VocabParallelEmbedding) -> None:
-        assert embed.num_embeddings == self.num_embeddings
-        assert embed.embedding_dim == self.embedding_dim
-        # Bypass NNX __setattr__ to store a plain Python reference.
-        # NNX Pytree traversal only visits attributes set via its own
-        # __setattr__, so this reference is invisible to JAX tracing.
-        object.__setattr__(self, '_tied_embed_ref', embed)
 
     def load_weight(self, weight: jax.Array) -> None:
         start = self.tp_rank * self.num_embeddings_per_partition
@@ -108,26 +93,23 @@ class ParallelLMHead(nnx.Module):
         arr = jnp.asarray(weight[start:end, :])
         self.weight = nnx.Param(arr)
 
-    @property
-    def effective_weight(self) -> jax.Array:
-        """Return the weight matrix as a plain jax.Array.
-
-        Reads the tied VocabParallelEmbedding's weight when tie_word_embeddings
-        is True, otherwise falls back to this module's own weight parameter.
-        The tied embed reference is stored via object.__setattr__ to bypass
-        NNX Pytree type enforcement.
-        """
-        embed = object.__getattribute__(self, '_tied_embed_ref')
-        if embed is not None:
-            return embed.weight_array
-        return _param_array(self.weight)
-
     def __call__(
         self,
         x: jax.Array,
         last_indices: Optional[jax.Array] = None,
+        weight_override: Optional[jax.Array] = None,
     ) -> jax.Array:
-        ew = self.effective_weight
+        """Compute logits.
+
+        Args:
+            x: hidden states, shape [T, hidden_size]
+            last_indices: if provided, select x[last_indices] before matmul
+            weight_override: if provided (for tied-weight models), use this
+                array instead of self.weight.  Caller (LlamaForCausalLM)
+                passes embed_tokens.weight_array here so that JIT sees it as
+                a plain Array argument — no shared-node trace level conflict.
+        """
         if last_indices is not None:
             x = x[last_indices]
-        return x @ ew.T
+        w = weight_override if weight_override is not None else _param_array(self.weight)
+        return x @ w.T

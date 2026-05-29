@@ -111,20 +111,26 @@ def test_lm_head_last_indices():
 
 
 def test_weight_tying():
+    """Tied weights: caller passes embed weight as weight_override."""
     vocab, dim = 128, 32
     w_np = rand((vocab, dim))
     emb = VocabParallelEmbedding(vocab, dim)
     emb.load_weight(jnp.array(w_np))
     head = ParallelLMHead(vocab, dim)
-    head.tie_weights(emb)
     x_np = rand((4, dim))
+    # Pass embed weight explicitly, simulating LlamaForCausalLM behaviour.
     np.testing.assert_allclose(
-        np.array(head(jnp.array(x_np))), x_np @ w_np.T, atol=ATOL_MATMUL
+        np.array(head(jnp.array(x_np), weight_override=emb.weight_array)),
+        x_np @ w_np.T,
+        atol=ATOL_MATMUL,
     )
+    # After updating embed weights, weight_override reflects the new values.
     new_w = rand((vocab, dim), seed=99)
     emb.load_weight(jnp.array(new_w))
     np.testing.assert_allclose(
-        np.array(head(jnp.array(x_np))), x_np @ new_w.T, atol=ATOL_MATMUL
+        np.array(head(jnp.array(x_np), weight_override=emb.weight_array)),
+        x_np @ new_w.T,
+        atol=ATOL_MATMUL,
     )
 
 
