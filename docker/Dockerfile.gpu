@@ -7,24 +7,16 @@
 #   This image uses CUDA 12.4 inside the container.
 #   Your host driver only needs to support CUDA >= 12.4 (driver >= 550).
 #   CUDA 13.x drivers are fully backward-compatible with CUDA 12.x containers.
-#
-# Usage: see README.md
 # =============================================================================
 FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
-# Prevent interactive prompts during apt
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
-
-# XLA / JAX GPU tuning
-# Set to false so JAX doesn’t grab all VRAM upfront
 ENV XLA_PYTHON_CLIENT_PREALLOCATE=false
-# Fraction of GPU memory JAX may use (0.85 = 85%)
 ENV XLA_PYTHON_CLIENT_MEM_FRACTION=0.85
 ENV JAX_PLATFORMS=cuda
 
-# System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.11 \
     python3.11-dev \
@@ -37,33 +29,36 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Make python3.11 the default python/pip
 RUN update-alternatives --install /usr/bin/python  python  /usr/bin/python3.11 1 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 && \
     update-alternatives --install /usr/bin/pip     pip     /usr/bin/pip3       1
 
-# Upgrade pip
 RUN pip install --upgrade pip setuptools wheel
 
-# ---- JAX with CUDA 12 (separate layer for Docker cache efficiency) ----------
-RUN pip install --upgrade \
-    "jax[cuda12]>=0.4.25" \
-    "jaxlib>=0.4.25"
+# ---- JAX with CUDA 12 -------------------------------------------------------
+# Do NOT specify jaxlib separately: jax[cuda12] pulls the correct
+# jaxlib-cuda12 wheel via its extras_require. Adding a bare jaxlib pin
+# causes pip to try resolving a CPU jaxlib and conflict with the GPU wheel.
+RUN pip install \
+    "jax[cuda12]" \
+    --find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 
 # ---- ML / project dependencies ----------------------------------------------
 RUN pip install --upgrade \
-    "flax>=0.9.0" \
+    "flax>=0.10.0" \
     "optax>=0.2.0" \
     "transformers>=4.40.0" \
+    "huggingface_hub>=0.23.0" \
     "safetensors>=0.4.0" \
     "chex>=0.1.86" \
     "numpy>=1.26"
 
 # ---- Dev / test dependencies ------------------------------------------------
 # torch CPU-only: only used for numerical reference tests, no CUDA needed here
+RUN pip install \
+    torch --extra-index-url https://download.pytorch.org/whl/cpu
+
 RUN pip install --upgrade \
-    torch --extra-index-url https://download.pytorch.org/whl/cpu && \
-    pip install --upgrade \
     "pytest>=8.0" \
     "pytest-xdist" \
     "ruff>=0.4" \
@@ -72,9 +67,7 @@ RUN pip install --upgrade \
 
 WORKDIR /workspace
 
-# Copy project files and install in editable mode
 COPY . .
 RUN pip install -e ".[dev]"
 
-# Default: run unit tests
 CMD ["pytest", "tests/unit/", "-v"]
