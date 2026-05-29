@@ -17,8 +17,9 @@ echo "    GPU        : $GPU_ID"
 echo "    HF cache   : $HF_CACHE"
 echo ""
 
-# Force rebuild to avoid stale .pyc in Docker layer cache
-docker build --no-cache --progress=plain -f docker/Dockerfile.gpu -t nano-vllm-jax:gpu .
+# 利用 Docker 层缓存：不加 --no-cache，依赖层在未变更时直接复用
+# 只有源代码变更时才需重建最后的 COPY + pip install 层
+docker build --progress=plain -f docker/Dockerfile.gpu -t nano-vllm-jax:gpu .
 
 if [ "$GPU_ID" = "all" ]; then
   GPU_FLAG="--gpus all"
@@ -80,46 +81,16 @@ print(f"  vocab_size         = {mc.vocab_size}")
 print(f"  tie_word_embeddings= {mc.tie_word_embeddings}")
 print(f"  hidden_size        = {mc.hidden_size}")
 
-# ============================================================
-# 权重绑定诊断：在 JIT 外部直接比较两个权重
-# ============================================================
+# 权重绑定诊断
 print("\n[DIAG] === 权重绑定检查 ===")
-
 embed_w = np.array(model.model.embed_tokens.weight_array, dtype=np.float32)
-print(f"  embed_tokens.weight_array  shape={embed_w.shape}  norm={np.linalg.norm(embed_w):.4f}  max_abs={np.abs(embed_w).max():.6f}")
-print(f"  embed_tokens.weight_array  is_zero={np.abs(embed_w).max() == 0}")
-print(f"  embed_tokens.weight_array  sample[0,:5]={embed_w[0,:5].tolist()}")
-
+print(f"  embed_tokens  shape={embed_w.shape}  norm={np.linalg.norm(embed_w):.4f}  is_zero={np.abs(embed_w).max()==0}")
 lmh_w = np.array(model.lm_head.effective_weight, dtype=np.float32)
-print(f"  lm_head.effective_weight   shape={lmh_w.shape}  norm={np.linalg.norm(lmh_w):.4f}  max_abs={np.abs(lmh_w).max():.6f}")
-print(f"  lm_head.effective_weight   is_zero={np.abs(lmh_w).max() == 0}")
-print(f"  lm_head.effective_weight   sample[0,:5]={lmh_w[0,:5].tolist()}")
-
+print(f"  lm_head       shape={lmh_w.shape}  norm={np.linalg.norm(lmh_w):.4f}  is_zero={np.abs(lmh_w).max()==0}")
 if mc.tie_word_embeddings:
-    are_equal = np.allclose(embed_w, lmh_w, atol=1e-4)
-    print(f"  tie_word_embeddings=True → embed_w == lmh_w? {are_equal}")
-    if not are_equal:
-        diff = np.abs(embed_w - lmh_w).max()
-        print(f"  !! 不相等！max_diff={diff:.6f}")
-        print(f"  说明 lm_head 没有正确使用 embed_tokens 权重")
+    ok = np.allclose(embed_w, lmh_w, atol=1e-4)
+    print(f"  tied weights match: {ok}" + ("" if ok else f"  !! max_diff={np.abs(embed_w-lmh_w).max():.6f}"))
 
-# 在 JIT 外直接计算一个 token 的 logit，确认模型本身正常
-print("\n[DIAG] === 直接推理校验（单 token, 不过 JIT）===")
-paris_ids = tok.encode("Paris", add_special_tokens=False)
-print(f"  'Paris' token ids: {paris_ids}")
-
-test_id = 151644  # <|im_start|>
-hidden_direct = embed_w[test_id]
-if mc.tie_word_embeddings:
-    logit_direct = hidden_direct @ embed_w.T
-else:
-    logit_direct = hidden_direct @ lmh_w.T
-print(f"  直接计算 logit[{test_id}] top-5 ids: {np.argsort(logit_direct)[::-1][:5].tolist()}")
-print(f"  argmax={np.argmax(logit_direct)}  text={tok.decode([int(np.argmax(logit_direct))])!r}")
-
-# ============================================================
-# 正常推理
-# ============================================================
 kv_cache = PagedKVCache(
     num_layers=mc.num_hidden_layers,
     num_kv_heads=mc.num_key_value_heads,
@@ -175,17 +146,16 @@ logits = _jit_prefill(
     num_real_tokens=T,
 )
 logits_np = np.array(logits, dtype=np.float32)
-print(f"\n[DEBUG] Prefill logits shape: {logits_np.shape}")
-print(f"  min={logits_np[0].min():.4f}  max={logits_np[0].max():.4f}")
-top5_idx = np.argsort(logits_np[0])[::-1][:5]
-print(f"  Top-5 tokens: {[tok.decode([i]) for i in top5_idx]}")
+print(f"\n[DEBUG] Prefill logits: min={logits_np[0].min():.4f}  max={logits_np[0].max():.4f}")
+top5 = np.argsort(logits_np[0])[::-1][:5]
+print(f"  Top-5: {[tok.decode([i]) for i in top5]}")
 
 argmax_token = int(np.argmax(logits_np[0]))
 print(f"\n[DEBUG] Prefill argmax: id={argmax_token}  text={tok.decode([argmax_token])!r}")
 
-print(f"\n[DEBUG] ===== Decode 前5步 =====")
+print(f"\n[DEBUG] ===== Decode 前10步 =====")
 seq.append_token(argmax_token)
-for step_i in range(5):
+for step_i in range(10):
     step = seq.total_len - 1
     dec_ids  = jnp.array([seq.last_token_id], dtype=jnp.int32)
     dec_pos  = jnp.array([step], dtype=jnp.int32)
@@ -200,9 +170,10 @@ for step_i in range(5):
     )
     dec_np = np.array(dec_logits, dtype=np.float32)
     next_tok = int(np.argmax(dec_np[0]))
-    print(f"  step {step_i+1}: in={tok.decode([seq.last_token_id])!r}  -> out={tok.decode([next_tok])!r}")
+    print(f"  step {step_i+1}: {tok.decode([seq.last_token_id])!r} -> {tok.decode([next_tok])!r}")
     seq.append_token(next_tok)
+    if next_tok == tok.eos_token_id:
+        break
 
 print(f"\n[DEBUG] 生成结果: {tok.decode(seq.all_token_ids[T:])!r}")
-print("\n[DEBUG] ===== 诊断完成 =====\n")
 PYEOF

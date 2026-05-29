@@ -2,7 +2,16 @@
 # nano-vllm-jax — CPU Development Image
 # Base: Python 3.11 slim (no CUDA)
 # JAX: CPU-only build
-# Usage: see README.md
+#
+# Layer cache strategy (ordered by change frequency, low → high):
+#   1. System packages     — almost never changes
+#   2. pip/wheel upgrade   — rarely changes
+#   3. JAX cpu             — changes on JAX version bumps only
+#   4. ML dependencies     — changes on dep version bumps
+#   5. Dev/test tools      — changes occasionally
+#   6. pyproject.toml only — invalidates dep install only when deps change
+#   7. pip install -e .    — installs project metadata (no source yet)
+#   8. COPY source code    — changes on every code edit (cheap: just re-link)
 # =============================================================================
 FROM python:3.11-slim-bookworm
 
@@ -10,7 +19,7 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV JAX_PLATFORMS=cpu
 
-# System dependencies
+# ---- 1. System packages -----------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
@@ -18,35 +27,42 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip
+# ---- 2. pip bootstrap -------------------------------------------------------
 RUN pip install --upgrade pip setuptools wheel
 
-# Install CPU-only JAX
-RUN pip install --upgrade \
+# ---- 3. JAX CPU -------------------------------------------------------------
+RUN pip install \
     "jax>=0.4.25" \
     "jaxlib>=0.4.25"
 
-# Install remaining Python dependencies
-# torch CPU-only (only needed for numerical reference tests)
-RUN pip install --upgrade \
-    "flax>=0.9.0" \
+# ---- 4. ML dependencies -----------------------------------------------------
+RUN pip install \
+    "flax>=0.10.0" \
     "optax>=0.2.0" \
     "transformers>=4.40.0" \
+    "huggingface_hub>=0.23.0" \
     "safetensors>=0.4.0" \
     "chex>=0.1.86" \
-    "numpy>=1.26" \
-    "torch>=2.3" --extra-index-url https://download.pytorch.org/whl/cpu \
+    "numpy>=1.26"
+
+# ---- 5. Dev / test tools (torch CPU for numerical reference tests) ----------
+RUN pip install \
+    torch --extra-index-url https://download.pytorch.org/whl/cpu
+
+RUN pip install \
     "pytest>=8.0" \
     "pytest-xdist" \
     "ruff>=0.4" \
     "ipython"
 
-# Set working directory
+# ---- 6. Project metadata only (invalidates on pyproject.toml changes) -------
 WORKDIR /workspace
+COPY pyproject.toml README.md ./
+RUN mkdir -p nanovllm_jax && touch nanovllm_jax/__init__.py
+RUN pip install -e ".[dev]" --no-deps
 
-# Copy project and install in editable mode
+# ---- 7. Full source code (invalidates on any .py edit, but deps stay cached) -
 COPY . .
-RUN pip install -e ".[dev]"
+RUN pip install -e ".[dev]" --no-build-isolation
 
-# Default command: run unit tests
 CMD ["pytest", "tests/unit/", "-v"]

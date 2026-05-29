@@ -1,12 +1,17 @@
 # =============================================================================
 # nano-vllm-jax — GPU Development Image
 # Base: NVIDIA CUDA 12.4.1 + cuDNN 9 + Ubuntu 22.04
-# JAX: jax[cuda12] (XLA GPU backend)
+# JAX: jax[cuda12] via Google JAX releases
 #
-# Host CUDA compatibility:
-#   This image uses CUDA 12.4 inside the container.
-#   Your host driver only needs to support CUDA >= 12.4 (driver >= 550).
-#   CUDA 13.x drivers are fully backward-compatible with CUDA 12.x containers.
+# Layer cache strategy (ordered by change frequency, low → high):
+#   1. System packages     — almost never changes
+#   2. pip/wheel upgrade   — rarely changes
+#   3. JAX + jaxlib        — changes on JAX version bumps only
+#   4. ML dependencies     — changes on dep version bumps
+#   5. Dev/test tools      — changes occasionally
+#   6. pyproject.toml only — invalidates dep install only when deps change
+#   7. pip install -e .    — installs project metadata (no source yet)
+#   8. COPY source code    — changes on every code edit (cheap: just re-link)
 # =============================================================================
 FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
@@ -17,6 +22,7 @@ ENV XLA_PYTHON_CLIENT_PREALLOCATE=false
 ENV XLA_PYTHON_CLIENT_MEM_FRACTION=0.85
 ENV JAX_PLATFORMS=cuda
 
+# ---- 1. System packages (cached unless base image changes) ------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.11 \
     python3.11-dev \
@@ -33,18 +39,16 @@ RUN update-alternatives --install /usr/bin/python  python  /usr/bin/python3.11 1
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 && \
     update-alternatives --install /usr/bin/pip     pip     /usr/bin/pip3       1
 
+# ---- 2. pip bootstrap -------------------------------------------------------
 RUN pip install --upgrade pip setuptools wheel
 
-# ---- JAX with CUDA 12 -------------------------------------------------------
-# Do NOT specify jaxlib separately: jax[cuda12] pulls the correct
-# jaxlib-cuda12 wheel via its extras_require. Adding a bare jaxlib pin
-# causes pip to try resolving a CPU jaxlib and conflict with the GPU wheel.
+# ---- 3. JAX + CUDA (heaviest layer, changes least often) --------------------
 RUN pip install \
     "jax[cuda12]" \
     --find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 
-# ---- ML / project dependencies ----------------------------------------------
-RUN pip install --upgrade \
+# ---- 4. ML dependencies -----------------------------------------------------
+RUN pip install \
     "flax>=0.10.0" \
     "optax>=0.2.0" \
     "transformers>=4.40.0" \
@@ -53,21 +57,26 @@ RUN pip install --upgrade \
     "chex>=0.1.86" \
     "numpy>=1.26"
 
-# ---- Dev / test dependencies ------------------------------------------------
-# torch CPU-only: only used for numerical reference tests, no CUDA needed here
+# ---- 5. Dev / test tools ----------------------------------------------------
 RUN pip install \
     torch --extra-index-url https://download.pytorch.org/whl/cpu
 
-RUN pip install --upgrade \
+RUN pip install \
     "pytest>=8.0" \
     "pytest-xdist" \
     "ruff>=0.4" \
     "ipython" \
     "ipykernel"
 
+# ---- 6. Project metadata only (invalidates on pyproject.toml changes) -------
 WORKDIR /workspace
+COPY pyproject.toml README.md ./
+# Create minimal stub so hatchling can install metadata without full source
+RUN mkdir -p nanovllm_jax && touch nanovllm_jax/__init__.py
+RUN pip install -e ".[dev]" --no-deps
 
+# ---- 7. Full source code (invalidates on any .py edit, but deps stay cached) -
 COPY . .
-RUN pip install -e ".[dev]"
+RUN pip install -e ".[dev]" --no-build-isolation
 
 CMD ["pytest", "tests/unit/", "-v"]
