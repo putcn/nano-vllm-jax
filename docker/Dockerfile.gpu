@@ -5,7 +5,7 @@
 #
 # Layer cache strategy (ordered by change frequency, low → high):
 #   1. System packages     — almost never changes
-#   2. pip/wheel upgrade   — rarely changes
+#   2. pip/wheel/hatchling  — rarely changes
 #   3. JAX + jaxlib        — changes on JAX version bumps only
 #   4. ML dependencies     — changes on dep version bumps
 #   5. Dev/test tools      — changes occasionally
@@ -39,8 +39,8 @@ RUN update-alternatives --install /usr/bin/python  python  /usr/bin/python3.11 1
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 && \
     update-alternatives --install /usr/bin/pip     pip     /usr/bin/pip3       1
 
-# ---- 2. pip bootstrap -------------------------------------------------------
-RUN pip install --upgrade pip setuptools wheel
+# ---- 2. pip bootstrap + build backend (hatchling needed for pip install -e) --
+RUN pip install --upgrade pip setuptools wheel hatchling
 
 # ---- 3. JAX + CUDA (heaviest layer, changes least often) --------------------
 RUN pip install \
@@ -71,12 +71,11 @@ RUN pip install \
 # ---- 6. Project metadata only (invalidates on pyproject.toml changes) -------
 WORKDIR /workspace
 COPY pyproject.toml README.md ./
-# Create minimal stub so hatchling can install metadata without full source
 RUN mkdir -p nanovllm_jax && touch nanovllm_jax/__init__.py
 RUN pip install -e ".[dev]" --no-deps
 
 # ---- 7. Full source code (invalidates on any .py edit, but deps stay cached) -
 COPY . .
-RUN pip install -e ".[dev]" --no-build-isolation
+RUN pip install -e ".[dev]"
 
 CMD ["pytest", "tests/unit/", "-v"]

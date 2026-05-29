@@ -5,7 +5,7 @@
 #
 # Layer cache strategy (ordered by change frequency, low → high):
 #   1. System packages     — almost never changes
-#   2. pip/wheel upgrade   — rarely changes
+#   2. pip/wheel/hatchling  — rarely changes
 #   3. JAX cpu             — changes on JAX version bumps only
 #   4. ML dependencies     — changes on dep version bumps
 #   5. Dev/test tools      — changes occasionally
@@ -27,8 +27,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# ---- 2. pip bootstrap -------------------------------------------------------
-RUN pip install --upgrade pip setuptools wheel
+# ---- 2. pip bootstrap + build backend ---------------------------------------
+RUN pip install --upgrade pip setuptools wheel hatchling
 
 # ---- 3. JAX CPU -------------------------------------------------------------
 RUN pip install \
@@ -63,6 +63,6 @@ RUN pip install -e ".[dev]" --no-deps
 
 # ---- 7. Full source code (invalidates on any .py edit, but deps stay cached) -
 COPY . .
-RUN pip install -e ".[dev]" --no-build-isolation
+RUN pip install -e ".[dev]"
 
 CMD ["pytest", "tests/unit/", "-v"]
