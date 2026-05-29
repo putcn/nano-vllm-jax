@@ -18,7 +18,7 @@ echo "    HF cache   : $HF_CACHE"
 echo ""
 
 # Force rebuild to avoid stale .pyc in Docker layer cache
-docker build --no-cache -q -f docker/Dockerfile.gpu -t nano-vllm-jax:gpu . 2>&1 | tail -5
+docker build --no-cache --progress=plain -f docker/Dockerfile.gpu -t nano-vllm-jax:gpu .
 
 if [ "$GPU_ID" = "all" ]; then
   GPU_FLAG="--gpus all"
@@ -85,13 +85,11 @@ print(f"  hidden_size        = {mc.hidden_size}")
 # ============================================================
 print("\n[DIAG] === 权重绑定检查 ===")
 
-# embed_tokens 权重
 embed_w = np.array(model.model.embed_tokens.weight_array, dtype=np.float32)
 print(f"  embed_tokens.weight_array  shape={embed_w.shape}  norm={np.linalg.norm(embed_w):.4f}  max_abs={np.abs(embed_w).max():.6f}")
 print(f"  embed_tokens.weight_array  is_zero={np.abs(embed_w).max() == 0}")
 print(f"  embed_tokens.weight_array  sample[0,:5]={embed_w[0,:5].tolist()}")
 
-# lm_head 自身权重方 (effective_weight 返回自身 weight)
 lmh_w = np.array(model.lm_head.effective_weight, dtype=np.float32)
 print(f"  lm_head.effective_weight   shape={lmh_w.shape}  norm={np.linalg.norm(lmh_w):.4f}  max_abs={np.abs(lmh_w).max():.6f}")
 print(f"  lm_head.effective_weight   is_zero={np.abs(lmh_w).max() == 0}")
@@ -107,20 +105,16 @@ if mc.tie_word_embeddings:
 
 # 在 JIT 外直接计算一个 token 的 logit，确认模型本身正常
 print("\n[DIAG] === 直接推理校验（单 token, 不过 JIT）===")
-# 取 token 'Paris' 的 id
 paris_ids = tok.encode("Paris", add_special_tokens=False)
 print(f"  'Paris' token ids: {paris_ids}")
 
-# 构造一个极简单的 one-hot 输入，知道 embed_tokens(输入) = embed_w[输入]
-test_id = 151644  # <|im_start|> token 一定在词表里
-hidden_direct = embed_w[test_id]  # shape (hidden_size,)
+test_id = 151644  # <|im_start|>
+hidden_direct = embed_w[test_id]
 if mc.tie_word_embeddings:
-    # weight_override = embed_w
-    logit_direct = hidden_direct @ embed_w.T  # (vocab_size,)
+    logit_direct = hidden_direct @ embed_w.T
 else:
     logit_direct = hidden_direct @ lmh_w.T
 print(f"  直接计算 logit[{test_id}] top-5 ids: {np.argsort(logit_direct)[::-1][:5].tolist()}")
-print(f"  直接计算 logit[{test_id}] top-5 vals: {logit_direct[np.argsort(logit_direct)[::-1][:5]].tolist()}")
 print(f"  argmax={np.argmax(logit_direct)}  text={tok.decode([int(np.argmax(logit_direct))])!r}")
 
 # ============================================================
@@ -189,7 +183,6 @@ print(f"  Top-5 tokens: {[tok.decode([i]) for i in top5_idx]}")
 argmax_token = int(np.argmax(logits_np[0]))
 print(f"\n[DEBUG] Prefill argmax: id={argmax_token}  text={tok.decode([argmax_token])!r}")
 
-# 多步 decode
 print(f"\n[DEBUG] ===== Decode 前5步 =====")
 seq.append_token(argmax_token)
 for step_i in range(5):
@@ -211,5 +204,5 @@ for step_i in range(5):
     seq.append_token(next_tok)
 
 print(f"\n[DEBUG] 生成结果: {tok.decode(seq.all_token_ids[T:])!r}")
-print("\n[DEBUG] ===== 诺断完成 =====\n")
+print("\n[DEBUG] ===== 诊断完成 =====\n")
 PYEOF
