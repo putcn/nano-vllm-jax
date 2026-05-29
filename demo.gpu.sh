@@ -131,11 +131,15 @@ print(f"\n[DEBUG] Pre-allocating {blocks_needed} blocks for {total_tokens_needed
 seq = Sequence(seq_id=0, prompt_token_ids=input_ids,
                sampling_params=SamplingParams(temperature=0.0, max_tokens=max_tokens))
 
-# Allocate all blocks upfront to avoid IndexError during decode
-for _ in range(blocks_needed):
-    block_manager.allocate(seq)
+# FIX 1: block_manager.allocate(seq) is idempotent — it always computes
+# _blocks_needed(seq.total_len) which equals ceil(T/block_size) = 2 for a
+# 24-token prompt, so looping N times still allocates only 2 blocks.
+# Instead, directly append_slot until we have blocks_needed entries.
+while len(seq.block_table) < blocks_needed:
+    seq.block_table.append(block_manager._allocator.allocate())
 
 print(f"[DEBUG] block_table length: {len(seq.block_table)}")
+print(f"[DEBUG] block_table: {list(seq.block_table)}")
 
 # ---- Prefill ----
 all_ids = jnp.array(input_ids, dtype=jnp.int32)
@@ -155,6 +159,7 @@ if T_pad != T:
     all_bo  = pad1d(all_bo,  T_pad)
 
 print(f"\n[DEBUG] Prefill: T_real={T}, T_pad={T_pad}")
+print(f"[DEBUG] Prefill bi (first {T}): {list(np.array(all_bi[:T]))}")
 logits = _jit_prefill(
     model, kv_cache,
     all_ids, all_pos, all_bi, all_bo, seq_lens, last_indices,
@@ -181,9 +186,16 @@ for step_i in range(max_tokens - 1):
     blk_num = step // block_size
     blk_off = step % block_size
 
-    # Safety check: should never happen since we pre-allocated
+    # FIX 2: ensure the block for this step exists.
+    # Pre-allocation covered prompt+max_tokens, but append_token grows
+    # seq.total_len so we may need a slot beyond the pre-allocated range
+    # if the caller changes max_tokens. append_slot is safe to call every
+    # step — it only allocates when the current capacity is exceeded.
+    block_manager.append_slot(seq)
+
+    # Sanity check (should never trigger after the fixes above)
     if blk_num >= len(seq.block_table):
-        print(f"  [WARN] step {step}: blk_num={blk_num} >= block_table len {len(seq.block_table)}, stopping")
+        print(f"  [WARN] step {step_i+1}: blk_num={blk_num} >= block_table len {len(seq.block_table)}, stopping")
         break
 
     dec_ids  = jnp.array([seq.last_token_id], dtype=jnp.int32)
@@ -191,13 +203,21 @@ for step_i in range(max_tokens - 1):
     dec_bi   = jnp.array([seq.block_table[blk_num]], dtype=jnp.int32)
     dec_bo   = jnp.array([blk_off], dtype=jnp.int32)
     dec_lens = jnp.array([seq.total_len], dtype=jnp.int32)
+    # Pass the full block_table so kv_cache.read() can access all context blocks
     dec_bt   = jnp.array([list(seq.block_table)], dtype=jnp.int32)
+
+    print(f"  [DEBUG] step {step_i+1:3d}: pos={step} blk_num={blk_num} blk_off={blk_off} "
+          f"bt_len={len(seq.block_table)} dec_bt_shape={dec_bt.shape}")
+
     dec_logits = _jit_decode(
         model, kv_cache,
         dec_ids, dec_pos, dec_bi, dec_bo, dec_lens, dec_bt,
         num_real_seqs=1,
     )
     dec_np = np.array(dec_logits, dtype=np.float32)
+    top5_dec = np.argsort(dec_np[0])[::-1][:3]
+    print(f"         logits min={dec_np[0].min():.3f} max={dec_np[0].max():.3f} "
+          f"top3={[tok.decode([i]) for i in top5_dec]}")
     next_tok = int(np.argmax(dec_np[0]))
     print(f"  step {step_i+1:3d}: {tok.decode([seq.last_token_id])!r} -> {tok.decode([next_tok])!r}  (id={next_tok})")
     seq.append_token(next_tok)
